@@ -1,0 +1,14 @@
+# Written by the script at runtime, and specific to one machine's setup.
+# The calibrated defaults are baked into fisch-autofisher.ahk, so a fresh clone
+# works without this file; see "Recalibrating" in the README.
+fisch-autofisher.ini
+
+# Diagnostic output from bounded runs. Regenerated on every run.
+reeltrace.csv
+selftest-report.txt
+doctor-report.txt
+runfor-report.txt
+ctrltest-report.txt
+
+# Snapshot of an abandoned click-rate controller, kept locally for reference.
+*.bak
