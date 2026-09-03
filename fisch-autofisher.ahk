@@ -40,7 +40,14 @@ REF_H := 1080
 ; relatively taller and bleeds into the progress-bar box, which makes the script
 ; believe a fish is permanently hooked. Every box below can be overridden from
 ; the [boxes] section of fisch-autofisher.ini without touching this file.
-BOX_PROGRESS := [700,  970, 1240,  995]   ; catch-progress bar  -> fish_on
+; The reel progress FILL is anchored at x=750 and grows rightward, so reading
+; just its origin is enough to know a fight is on - and it is the only way to
+; avoid the hotbar. The old box asked "any white pixel in 540x25", which on an
+; account with a 9-slot hotbar and rod-description text put "Press (G) To Open"
+; (x 895..1025) inside it: 452 white pixels while standing idle, so the bot
+; believed a fish was permanently hooked and never cast. Measured across 7
+; frames, this box reads 283 px while reeling and exactly 0 in every other state.
+BOX_PROGRESS := [744,  970,  784,  995]   ; reel progress fill origin -> fish_on
 BOX_HOTBAR   := [700, 1000, 1240, 1078]   ; item hotbar         -> hidden while casting/reeling
 BOX_RING     := [150,  150, 1580,  950]   ; SHAKE ring roams; right edge avoids the leaderboard
 BOX_TRACK    := [560,  900, 1360,  945]   ; reel bar, INCLUDING its end caps
@@ -99,7 +106,7 @@ INI_FILE  := A_ScriptDir . "\fisch-autofisher.ini"
 ; reelDampMs=150 from an abandoned click-rate experiment sat in the INI,
 ; overrode a retuned default of 40, and then re-saved itself - so a measurement
 ; that had already been reported was invalid, and nothing said so.
-SETTINGS_VERSION := 9
+SETTINGS_VERSION := 10
 
 ; ---------------------------------------------------------------- state
 
@@ -1349,7 +1356,12 @@ OvlMakeWindow(colour) {
     ; transparency is never initialised renders nothing at all - measured: 0
     ; pixels drawn, versus 7200 for the same window without the style.
     ; +E0x20 is WS_EX_TRANSPARENT, which is what makes it click-through.
-    g := Gui("-Caption +AlwaysOnTop +ToolWindow +E0x20 +Disabled")
+    ; -DPIScale is essential, not cosmetic. AHK scales Gui coordinates by the
+    ; display DPI unless told not to, while PixelSearch reads physical pixels -
+    ; so at 125% scaling every box was drawn at 1.25x its position and size, and
+    ; the overlay appeared scattered across the screen. Measured as a no-op at
+    ; 100%, so it is safe everywhere.
+    g := Gui("-Caption +AlwaysOnTop +ToolWindow +E0x20 +Disabled -DPIScale")
     g.BackColor := colour
     g.Show("NoActivate x-200 y-200 w1 h1")
     if Cfg["overlayHideFromCapture"]
@@ -2318,9 +2330,26 @@ RunSelfTest() {
         return
     }
     W("Roblox client : " . CW . "x" . CH . " at (" . CX . "," . CY . ")")
+    W("Display DPI   : " . A_ScreenDPI
+        . (A_ScreenDPI = 96 ? "  (100% scaling)"
+                            : "  (" . Round(A_ScreenDPI * 100 / 96) . "% scaling)"))
     W("Matches 1920x1080 calibration: " . ((CW = 1920 && CH = 1080) ? "YES" : "NO"))
     W("Roblox in front: " . (RobloxIsFront() ? "yes"
         : "NO — reads may be showing whatever covers it"))
+    W()
+    ; Where each box actually lands, in screen pixels. The overlay is hidden
+    ; from screen capture on purpose, so on another machine this is the only way
+    ; to see whether the boxes are where they should be.
+    W("detector boxes, as resolved on this screen:")
+    for name, b in Map("progress", BOX_PROGRESS, "hotbar", BOX_HOTBAR,
+                       "ring", BOX_RING, "track", BOX_TRACK,
+                       "caption", BOX_CAPTION) {
+        W(Format("  {1:-9} x {2}..{3}   y {4}..{5}   ({6} x {7} px)",
+                 name, SX(b[1]), SX(b[3]), SY(b[2]), SY(b[4]),
+                 SX(b[3]) - SX(b[1]), SY(b[4]) - SY(b[2])))
+    }
+    W("  reel scan row : y " . SY(ZONE_SCAN_Y)
+        . "   track interior x " . SX(TRACK_IN_X0) . ".." . SX(TRACK_IN_X1))
     W()
     W("detector readings:")
     W("  progress bar (fish_on) : " . (HasProgressBar() ? "FOUND" : "-"))
