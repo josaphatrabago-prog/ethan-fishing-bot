@@ -89,7 +89,7 @@ COL_TRACK     := 0x22121D
 ; matches any pixel whose every channel is >= 30. Measured separations on the
 ; scan row: track min-channel 4..8, fish bar ~37, warm zone ~44, white zone 215+.
 ; So this catches the zone in both states and rejects the track.
-NOT_TRACK_VAR := 225
+NOT_TRACK_VAR := 216
 
 ; Minimum matching pixels before a detector is believed. Guards against the
 ; single-pixel noise seen at state transitions.
@@ -106,7 +106,7 @@ INI_FILE  := A_ScriptDir . "\fisch-autofisher.ini"
 ; reelDampMs=150 from an abandoned click-rate experiment sat in the INI,
 ; overrode a retuned default of 40, and then re-saved itself - so a measurement
 ; that had already been reported was invalid, and nothing said so.
-SETTINGS_VERSION := 10
+SETTINGS_VERSION := 11
 
 ; ---------------------------------------------------------------- state
 
@@ -129,7 +129,14 @@ global Cfg := Map(
     ; never has to reject a candidate and search again.
     "tolFish",          24,   ; fish bar: measured spread needs ~34, not 18
     "tolTrack",         34,   ; legacy: track-colour match (no longer used to close runs)
-    "darkMax",          29,   ; a pixel is "dark" when EVERY channel is <= this
+    ; The boundary between the track and anything drawn on it. Raised from 29:
+    ; a second fishing location renders the track at #20221D, min channel 29,
+    ; sitting exactly ON the old boundary - so single pixels flickered across it
+    ; and the bar's left edge latched onto noise 61 px early. Measured window:
+    ; 33..44 works for every reference frame. Below 33 the new location's track
+    ; reads as bar; above 44 the old rod's off-target bar (min 47) reads as track.
+    ; 38 sits centrally, ~9 either side.
+    "darkMax",          38,   ; a pixel is "dark" when EVERY channel is <= this
     ; Steering, all derived from measured rates: the zone travels +198 px/s held
     ; and -207 px/s released, while the fish moves 30 px/s typically and up to
     ; 484 px/s when it darts.
@@ -146,6 +153,14 @@ global Cfg := Map(
     ; 232 px at 1920x1080, range 227..233 across 280 frames. Only the LEFT EDGE
     ; needs finding; the centre follows. Update this if the rod changes.
     "zoneWidth",       232,
+    ; The coloured-bar rod's bar is much wider. Selected by which marker is in
+    ; use, because there is no cheap way to measure the right edge every tick.
+    "zoneWidthPale",   411,
+    ; "bright" rather than "white": PixelSearch on 0xFFFFFF with this variation
+    ; matches any pixel whose channels are all >= 255 - tol. At 135 that is
+    ; >= 120, which catches a coloured progress bar as well as a white one, and
+    ; still reads 0 on every non-reeling reference frame.
+    "tolProgress",     135,
     ; The on-target test: look for the bar's white in a box this many pixels
     ; around the fish. Anything from 8 to 30 px scored perfectly offline; 14 is
     ; mid-range - wide enough to see past the fish glyph, narrow enough that
@@ -240,6 +255,10 @@ global MouseIsDown  := false
 global LastZoneX    := 0
 global LastFishX    := 0
 global LastFishSeen := 0   ; most recent fish x, for the zone search
+; Which marker rendering this fight is using. 0 = not yet known, 1 = blue-grey
+; (white bar), 2 = pale grey (coloured bar). Latched to 1 the first time the
+; blue-grey rule succeeds, so the pale pass can never match a white bar.
+global MarkerMode   := 0
 global SettingsKept  := []     ; keys the user tuned, kept across a version bump
 global SettingsMoved := []     ; keys reset because only the shipped default changed
 global SettingsReset := false  ; true when provenance was unknown and tuning was dropped
@@ -380,7 +399,10 @@ FindIn(box, colour, tol, &fx, &fy) {
 
 HasProgressBar() {
     global BOX_PROGRESS, COL_WHITE, Cfg
-    if FindIn(BOX_PROGRESS, COL_WHITE, Cfg["tolWhite"], &x, &y) {
+    ; BRIGHT, not white - the progress bar is white on one rod and a pink-to-
+    ; purple gradient on another. Measured: 350 px and 330 px respectively, and
+    ; 0 on every frame where no fight is running.
+    if FindIn(BOX_PROGRESS, COL_WHITE, Cfg["tolProgress"], &x, &y) {
         NoteHit("progress", x, y)
         return true
     }
@@ -436,12 +458,14 @@ HasCaption() {
 ;   right edge = first dark pixel after that
 ; Both states are handled by one pair of searches, and the CENTRE falls out.
 FindZone(&zoneLo, &zoneHi, &zoneCentre) {
-    global COL_WHITE, Cfg, NOT_TRACK_VAR, TRACK_IN_X0, TRACK_IN_X1
+    global COL_WHITE, Cfg, NOT_TRACK_VAR, TRACK_IN_X0, TRACK_IN_X1, MarkerMode
 
     zoneLo := zoneHi := zoneCentre := 0
     left := SX(TRACK_IN_X0)
     right := SX(TRACK_IN_X1)
-    width := SW(Cfg["zoneWidth"])
+    ; The two rod skins have very different bar widths, and the marker in use
+    ; identifies which one this is.
+    width := SW(MarkerMode = 2 ? Cfg["zoneWidthPale"] : Cfg["zoneWidth"])
 
     ; Only the LEFT EDGE is detected; the width is known, so the rest follows.
     ;
@@ -579,7 +603,7 @@ TrackScanX(screenX1, screenX2, colour, tol, &foundX) {
 ;
 ; With both: 3 px and 5 px error on the reference frames.
 FindFishX() {
-    global COL_FISH, COL_FISH_LIT, LastFishSeen
+    global COL_FISH, COL_FISH_LIT, LastFishSeen, MarkerMode
 
     ; The marker has two renderings - a dark blue-grey and a lighter one. Trying
     ; the dark one first costs nothing when it hits, which is the common case.
@@ -590,6 +614,17 @@ FindFishX() {
     x := ScanForMarker(COL_FISH)
     if !x
         x := ScanForMarker(COL_FISH_LIT)
+    if x
+        MarkerMode := 1      ; blue-grey marker: latch, and never try pale again
+
+    ; Only if no blue-grey marker has been seen this fight. On the old rod that
+    ; rule succeeds immediately, so this never runs - which is the point, because
+    ; on a white bar this pass would return the BAR as the fish.
+    if (!x && MarkerMode != 1) {
+        x := ScanForPaleMarker()
+        if x
+            MarkerMode := 2
+    }
 
     if x {
         NoteHit("fish", x, SY(ZONE_SCAN_Y))
@@ -598,6 +633,59 @@ FindFishX() {
     }
     NoteHit("fish", 0, 0)
     return 0
+}
+
+; The pale marker: a narrow achromatic column on a coloured bar.
+;
+; Two conditions, and both are needed. Achromatic (max channel minus min <= 12)
+; rejects the coloured bar it sits on. Narrow - neither side 24 px away is still
+; pale - rejects any broad white area. Even so this is only ever called when no
+; blue-grey marker has been seen this fight, because on a white bar no local test
+; can tell the bar's own edge from a marker.
+ScanForPaleMarker() {
+    global Cfg, TRACK_IN_X0, TRACK_IN_X1, ZONE_SCAN_Y, COL_WHITE
+
+    y1 := SY(ZONE_SCAN_Y - 3)
+    y2 := SY(ZONE_SCAN_Y + 3)
+    right := SX(TRACK_IN_X1)
+    cursor := SX(TRACK_IN_X0)
+    side := SW(24)
+
+    loop 10 {
+        found := false
+        try found := PixelSearch(&x, &y, cursor, y1, right, y2,
+                                 COL_WHITE, Cfg["tolWhite"])
+        if !found
+            return 0
+        if (IsAchromatic(x, y) && !IsPale(x - side, y) && !IsPale(x + side, y))
+            return x
+        cursor := x + SW(2)
+        if (cursor >= right)
+            return 0
+    }
+    return 0
+}
+
+IsAchromatic(x, y) {
+    try {
+        c := PixelGetColor(x, y)
+    } catch {
+        return false
+    }
+    r := (c >> 16) & 0xFF, g := (c >> 8) & 0xFF, b := c & 0xFF
+    return (Max(r, g, b) - Min(r, g, b)) <= 12
+}
+
+IsPale(x, y) {
+    global Cfg
+    try {
+        c := PixelGetColor(x, y)
+    } catch {
+        return false
+    }
+    lim := 255 - Cfg["tolWhite"]
+    return (((c >> 16) & 0xFF) >= lim) && (((c >> 8) & 0xFF) >= lim)
+        && ((c & 0xFF) >= lim)
 }
 
 ; One band-plus-ordering pass for a single marker colour.
@@ -810,6 +898,7 @@ DoShake(ring) {
 DoReel() {
     global Cfg, Counters, LastZoneX, Running, BOX_TRACK
     global LastFishX, LastFishAt, FishVel, MouseIsDown, LastFishSeen
+    global MarkerMode
     global LastZoneAt, ZoneVel, LastOvlAt, ProbeDir, ProbeUntil, OffSince
     global ReelTicks, ReelOnTicks, ReelPeriodMs, ReelPeriodN
     ; Fresh reel: no stale velocity or position from the previous fish.
@@ -817,6 +906,7 @@ DoReel() {
     LastZoneX := 0, LastZoneAt := 0, ZoneVel := 0
     ProbeDir := 0, ProbeUntil := 0, OffSince := 0
     LastFishSeen := 0   ; never inherit the previous fight's position
+    MarkerMode := 0     ; re-identify the rod skin on every fight
     guard := A_TickCount
     LastTickAt := 0
     ; Tolerate dropped frames. The progress bar detector reads a variable-width
@@ -853,7 +943,12 @@ DoReel() {
             LastZoneX := zC
             LastZoneAt := tNow
         }
-        onTarget := FishOnTarget(fishX)
+        ; With a pale marker the white test would match the MARKER, so it would
+        ; report "on target" forever. Fall back to geometry, which needs no
+        ; assumption about what colour the game paints anything.
+        onTarget := (MarkerMode = 2)
+            ? (haveZone && fishX && fishX >= zLo && fishX <= zHi)
+            : FishOnTarget(fishX)
 
         ; Dwell and true control rate. The rate is not what reelTickMs says: the
         ; loop is capture-bound, so this measures what it actually achieved.
