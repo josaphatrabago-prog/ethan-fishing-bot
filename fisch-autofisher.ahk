@@ -69,7 +69,13 @@ ZONE_W_MAX   := 620      ; 70% cap is ~545 px; allow slack
 ; expected 231. y 908 and y 940 are the track's BORDER rows - scanning those
 ; returns "not dark" right across the bar and yields a nonsense 602 px zone.
 ZONE_SCAN_Y  := 920
-BOX_CAPTION  := [700,  840, 1250,  885]   ; catch caption       -> success (UNVERIFIED)
+; The catch caption is CENTRED text, so it always covers the middle of the strip.
+; Reading only the middle is what keeps scenery out: the new rod throws a pink
+; sparkle (#FDE3FE, ref x 1115..1139) that put 141 white pixels in the old wide
+; box during a fight - which would have booked every lost fish as a catch and
+; pinned the reported rate at 100% regardless of what the bot actually did.
+; Measured over 8 frames: 221 px on a real catch, 0 on everything else.
+BOX_CAPTION  := [915,  840, 1035,  885]   ; centre of the catch caption -> success
 
 ; Colours are v2 RGB. NEVER paste a colour from an AHK v1 example: v1 was BGR,
 ; so red and blue are swapped and the match silently never fires.
