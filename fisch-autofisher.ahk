@@ -1,4 +1,4 @@
-#Requires AutoHotkey v2.0
+﻿#Requires AutoHotkey v2.0
 #SingleInstance Force
 #Warn All, Off
 
@@ -112,7 +112,17 @@ INI_FILE  := A_ScriptDir . "\fisch-autofisher.ini"
 ; reelDampMs=150 from an abandoned click-rate experiment sat in the INI,
 ; overrode a retuned default of 40, and then re-saved itself - so a measurement
 ; that had already been reported was invalid, and nothing said so.
-SETTINGS_VERSION := 11
+; 12: added stopTimeMs, velSmoothPct, shakeGraceMs, shakeMaxMs.
+; 13: stopTimeMs back to 0 (off). Version 12 shipped it at 120 and saved that to
+;     the INI, so the default alone cannot undo it - the bump is what lets a
+;     value nobody tuned move forward. This is the exact case the stamp exists
+;     for; see the reelDampMs note above.
+; 14: biteWaitMs 12000 -> 20000; the shake is now Enter-spammed on a timer
+;     rather than driven by the ring detector, so `bait`, shakeGraceMs and
+;     shakeMaxMs are all gone.
+; 15: added castingMaxMs. fish_on no longer needs LineOut when the hotbar is
+;     hidden, which is what let a reel go unseen and hang in `casting`.
+SETTINGS_VERSION := 15
 
 ; ---------------------------------------------------------------- state
 
@@ -130,6 +140,23 @@ global Cfg := Map(
     "reelTickMs",       10,   ; inner steering interval while reeling
     "tolWhite",         40,   ; PixelSearch variation for UI white
     "tolRing",          40,   ; PixelSearch variation for the SHAKE ring
+    ; Size gate for the ring, in reference pixels. The real prompt measures
+    ; 138x137; cyan scenery runs for hundreds of pixels. 240 accepts the prompt
+    ; with room for a wider skin and still rejects a wall of water.
+    "ringMaxSpan",     240,
+    "ringMinSpan",      16,
+    ; Zone measurement. The gap tolerance only has to step over the antialiased
+    ; SEAMS inside the bar - the arrow glyphs and the fish marker are themselves
+    ; "not track", so they never read as gaps. It must stay small: the track
+    ; carries scattered bright specks (water sparkle), and at 14 px the walk
+    ; bridged straight across the track to the fish marker and overshot the bar
+    ; by 145 px. Swept against hand-measured edges on three 1920x1080 frames:
+    ; anything from 2 to 10 gives a pixel-exact right edge on all of them, so 6
+    ; sits in the middle of a wide safe band rather than on an edge of it.
+    "zoneGapPx",         6,
+    ; Widest bar measured so far is 466 px, so 560 leaves headroom for a wider
+    ; rod without accepting most of the track.
+    "zoneMaxWidth",    560,
     ; Tightened from 34: at 24 the first match inside the scan band already
     ; satisfies B > G > R on both reference frames, so the ordering check almost
     ; never has to reject a candidate and search again.
@@ -155,6 +182,25 @@ global Cfg := Map(
     ; uncorrected drift. 70 px left on-target offsets at a median 57 px from
     ; centre, with under 60 px of margin before the fish slipped out.
     "reelDeadPx",       25,
+    ; STOPPING DISTANCE. reelDeadPx alone is a FIXED band, and a fixed band
+    ; cannot be right at two different speeds: the same 25 px that stops chatter
+    ; on a 30 px/s drift is nowhere near enough warning on a 484 px/s dart, so
+    ; the loop reverses too late and the bar's own momentum ejects the fish.
+    ; The band grows with CLOSING speed - how fast the fish and the bar are
+    ; converging - by the distance that closing covers in this many ms. The fixed
+    ; value above stays as the floor.
+    ;
+    ; DEFAULT 0, i.e. OFF, deliberately. A tuned reelDeadPx of 2 says the user
+    ; wants a correction every tick, and scaling the band up to ~96 px silently
+    ; overrides that with the opposite policy. Borrowing the idea was not enough:
+    ; it belongs to a controller that NEVER idles, and until this is measured
+    ; against a live fish the tuned value is the better bet. Raise it to ~120 to
+    ; try it.
+    "stopTimeMs",        0,
+    ; Weight of a fresh reading in the fish-velocity average, in percent. The
+    ; zone velocity has always been smoothed; the fish velocity was not, so a
+    ; single-frame edge jitter went straight into the lead term at full strength.
+    "velSmoothPct",     50,
     ; The bar's WIDTH is a rod stat and constant within a session - measured
     ; 232 px at 1920x1080, range 227..233 across 280 frames. Only the LEFT EDGE
     ; needs finding; the centre follows. Update this if the rod changes.
@@ -201,10 +247,25 @@ global Cfg := Map(
     ; cursor away from where the reel loop wants it.
     "shakeMethod",       1,
     "postCastMs",      600,   ; settle time after releasing a cast
+    ; Hard cap on the `casting` state, which is the fall-through for "the hotbar
+    ; is not visible". A real cast animation is 1-2 s; anything past this has
+    ; stopped being a cast, and before the cap existed the loop waited there for
+    ; ever - the "stuck at casting" hang. Generous because a reel whose LineOut
+    ; was lost is now detected as fish_on instead of landing here.
+    "castingMaxMs",  15000,
     ; How long to wait for a bite before assuming the cast failed and re-casting.
     ; This exists because a purely stateless `idle` fall-through re-casts
     ; immediately and cancels its own cast — measured: 89 casts, 0 bites in 149s.
-    "biteWaitMs",    12000,
+    ; Raised from 12000 alongside the move to Enter-spam shaking. Nothing can
+    ; extend this window any more: the `bait` state is gone, so the loop cannot
+    ; tell that a shake sequence is in progress and cannot hold the deadline
+    ; open the way shakeGraceMs used to. A bite that arrives late and then takes
+    ; several seconds of shaking would otherwise cross the deadline and get a
+    ; second cast on top of it, which cancels the fish. Measured earlier: bites
+    ; reached the reel about 7-8 s after the cast, so 20 s leaves real headroom.
+    ; The cost is only borne by casts that genuinely caught nothing, and a failed
+    ; cast is still caught immediately by the hotbar check in DoCast.
+    "biteWaitMs",    20000,
     ; The first cast straight after a reel reliably fails - the game is still
     ; finishing the catch. Settle before re-casting rather than fighting it.
     "postReelMs",     2500,
@@ -222,6 +283,21 @@ global Cfg := Map(
     ; Must stay BELOW postReelMs, or DoCast preempts the tail of the window and
     ; blocks ~1.7 s with the button held while a caption goes unread.
     "resolveMs",      2200,
+    ; ONE screen grab per reel tick instead of one per question.
+    ;
+    ; Measured on this machine: PixelSearch over a 3 px band costs 8.30 ms, a
+    ; single PixelGetColor costs 8.37 ms, and a BitBlt of the whole 764x3 strip
+    ; costs 8.33 ms. The cost is per SCREEN ACCESS, not per pixel - it is one
+    ; compositor frame at 120 Hz (1/120 s = 8.33 ms), because each access blocks
+    ; until the desktop is next composited. Reading the same strip out of memory
+    ; afterwards costs 0.26 ms for all 764 pixels.
+    ;
+    ; A reel tick asks 8 separate questions, so it paid 8 frames: modelled
+    ; 66.6 ms against the 63 ms median actually traced. Grabbing once and
+    ; answering all 8 from the buffer models at 8.6 ms - a 7.8x speed-up, and
+    ; the refresh rate is the floor, so there is nothing better to aim at.
+    ; Set to 0 to fall back to per-question PixelSearch.
+    "useCapture",        1,
     ; Refuse to start unless the Roblox client area matches the resolution the
     ; boxes were calibrated against. Set to 0 only after genuinely recalibrating
     ; the boxes for a different size - see "Recalibrating" in the README.
@@ -277,6 +353,11 @@ global ResolvePend  := false   ; a finished reel is waiting to be judged
 ; Nothing can be hooked while it is false, which is what stops the post-catch UI
 ; from being read as a fresh fight over and over.
 global LineOut      := false
+; True once the fish on the CURRENT line has been counted. One fish alternates
+; between shaking and reeling several times, so every re-entry into fish_on used
+; to book another hook and write the previous one off as lost. Counted per line
+; instead, which is what "a fish" actually means.
+global HookedThisLine := false
 ; Reel diagnostics, accumulated across a run so a bounded run can report them.
 global ReelTicks    := 0   ; control decisions taken while reeling
 global ReelOnTicks  := 0   ; of those, how many had the fish inside the bar
@@ -288,6 +369,11 @@ global LastZoneAt   := 0
 global ZoneVel      := 0      ; px/sec, signed - the zone has real momentum
 global StatusSince  := 0
 global NextCastAt   := 0
+; --- one-grab-per-tick screen capture (see useCapture) ---
+global CapBits := 0        ; pointer to the DIB's pixels, 32-bit BGRA, top-down
+global CapDC   := 0, CapBM := 0, CapOldBM := 0, CapScreenDC := 0
+global CapX := 0, CapY := 0, CapW := 0, CapH := 0   ; the grabbed box, screen coords
+global CapFresh := false   ; true only between a grab and the end of that tick
 global CastFailStreak := 0
 ; True once slot 1 has been toggled during the current failure streak. The next
 ; failure then flips it straight back rather than waiting out another three.
@@ -326,6 +412,7 @@ OnExit(ExitHandler)
 ExitHandler(reason, code) {
     ReleaseMouse()
     try OvlDestroy()
+    try CapFree()          ; GDI objects are not reclaimed on their own
     SaveSettings()
     return 0
 }
@@ -365,9 +452,15 @@ RefreshGeometry() {
     RbxHwnd := FindRoblox()
     if !RbxHwnd
         return false
+    pX := CX, pY := CY, pW := CW, pH := CH
     try WinGetClientPos(&CX, &CY, &CW, &CH, "ahk_id " . RbxHwnd)
     catch
         return false
+    ; The capture surface is sized and positioned from the client area, so if
+    ; the window moved or resized it is now pointing at the wrong pixels. Drop
+    ; it and let the next grab rebuild it.
+    if (CX != pX || CY != pY || CW != pW || CH != pH)
+        CapFree()
     return (CW > 0 && CH > 0)
 }
 
@@ -395,12 +488,218 @@ SH(n) => Round(CH * n / REF_H)
 
 ; Wrapper so every search shares one failure policy. v2 throws OSError when the
 ; screen capture itself fails, which is a different thing from "colour absent".
-FindIn(box, colour, tol, &fx, &fy) {
-    try
-        return PixelSearch(&fx, &fy, SX(box[1]), SY(box[2]), SX(box[3]), SY(box[4]),
-                           colour, tol)
-    catch
+; ---------------------------------------------------------------- capture
+;
+; One BitBlt per reel tick into a reusable DIB, then every detector answers its
+; question out of that buffer. See the useCapture note for the measurements.
+;
+; The grabbed box is the union of everything the REEL loop reads: the progress
+; bar and the track band. Anything outside it - the hotbar, the shake ring, the
+; catch caption - is not covered, and those callers fall back to PixelSearch
+; automatically. That is fine: they run on the 120 ms main tick, not the hot loop.
+
+; Build (or rebuild) the capture surface for the current geometry.
+CapInit() {
+    global CapBits, CapDC, CapBM, CapOldBM, CapScreenDC
+    global CapX, CapY, CapW, CapH
+    global BOX_PROGRESS, TRACK_IN_X0, TRACK_IN_X1, BOX_TRACK
+
+    CapFree()
+    ; Union of the progress box and the track band, in screen coords.
+    x1 := Min(SX(BOX_PROGRESS[1]), SX(TRACK_IN_X0), SX(BOX_TRACK[1]))
+    y1 := Min(SY(BOX_PROGRESS[2]), SY(BOX_TRACK[2]))
+    x2 := Max(SX(BOX_PROGRESS[3]), SX(TRACK_IN_X1), SX(BOX_TRACK[3]))
+    y2 := Max(SY(BOX_PROGRESS[4]), SY(BOX_TRACK[4]))
+    CapX := x1, CapY := y1
+    CapW := x2 - x1 + 1, CapH := y2 - y1 + 1
+    if (CapW < 1 || CapH < 1)
         return false
+
+    CapScreenDC := DllCall("GetDC", "Ptr", 0, "Ptr")
+    CapDC := DllCall("CreateCompatibleDC", "Ptr", CapScreenDC, "Ptr")
+    bi := Buffer(40, 0)
+    NumPut("UInt", 40, bi, 0)
+    NumPut("Int", CapW, bi, 4)
+    NumPut("Int", -CapH, bi, 8)     ; negative height = top-down rows
+    NumPut("UShort", 1, bi, 12)
+    NumPut("UShort", 32, bi, 14)
+    NumPut("UInt", 0, bi, 16)       ; BI_RGB
+    p := 0
+    CapBM := DllCall("CreateDIBSection", "Ptr", CapDC, "Ptr", bi, "UInt", 0,
+                     "Ptr*", &p, "Ptr", 0, "UInt", 0, "Ptr")
+    if (!CapBM)
+        return false
+    CapBits := p
+    CapOldBM := DllCall("SelectObject", "Ptr", CapDC, "Ptr", CapBM, "Ptr")
+    return true
+}
+
+CapFree() {
+    global CapBits, CapDC, CapBM, CapOldBM, CapScreenDC, CapFresh
+    if (CapDC && CapOldBM)
+        DllCall("SelectObject", "Ptr", CapDC, "Ptr", CapOldBM)
+    if (CapBM)
+        DllCall("DeleteObject", "Ptr", CapBM)
+    if (CapDC)
+        DllCall("DeleteDC", "Ptr", CapDC)
+    if (CapScreenDC)
+        DllCall("ReleaseDC", "Ptr", 0, "Ptr", CapScreenDC)
+    CapBits := 0, CapDC := 0, CapBM := 0, CapOldBM := 0, CapScreenDC := 0
+    CapFresh := false
+}
+
+; Take the single grab for this tick. Costs one compositor frame; everything
+; after it is free.
+CapGrab() {
+    global Cfg, CapBits, CapDC, CapScreenDC, CapX, CapY, CapW, CapH, CapFresh
+    CapFresh := false
+    if !Cfg["useCapture"]
+        return false
+    if (!CapBits && !CapInit())
+        return false
+    ok := DllCall("BitBlt", "Ptr", CapDC, "Int", 0, "Int", 0,
+                  "Int", CapW, "Int", CapH,
+                  "Ptr", CapScreenDC, "Int", CapX, "Int", CapY,
+                  "UInt", 0x00CC0020)     ; SRCCOPY
+    CapFresh := !!ok
+    return CapFresh
+}
+
+; True when this tick's buffer can answer for the whole of the given box.
+CapCovers(x1, y1, x2, y2) {
+    global CapFresh, CapX, CapY, CapW, CapH
+    return CapFresh && x1 >= CapX && y1 >= CapY
+        && x2 <= CapX + CapW - 1 && y2 <= CapY + CapH - 1
+}
+
+; The pixel at screen (sx, sy) as 0xRRGGBB, matching PixelGetColor. The DIB is
+; BGRA little-endian, so the low 24 bits are already R<<16|G<<8|B.
+CapAt(sx, sy) {
+    global CapBits, CapX, CapY, CapW
+    off := ((sy - CapY) * CapW + (sx - CapX)) * 4
+    return NumGet(CapBits + 0, off, "UInt") & 0xFFFFFF
+}
+
+; PixelGetColor, from the buffer when it covers the point.
+PixelAt(sx, sy) {
+    if CapCovers(sx, sy, sx, sy)
+        return CapAt(sx, sy)
+    try
+        return PixelGetColor(sx, sy)
+    catch
+        return -1
+}
+
+; PixelSearch's channel test: every channel within tol.
+CapNear(c, colour, tol) {
+    return Abs(((c >> 16) & 0xFF) - ((colour >> 16) & 0xFF)) <= tol
+        && Abs(((c >> 8) & 0xFF) - ((colour >> 8) & 0xFF)) <= tol
+        && Abs((c & 0xFF) - (colour & 0xFF)) <= tol
+}
+
+; PixelSearch over a screen box, answered from the buffer when possible.
+; Scans top row first then left to right, which is the order PixelSearch
+; documents - every caller here depends on that.
+SearchBox(x1, y1, x2, y2, colour, tol, &fx, &fy) {
+    global CapBits, CapX, CapY, CapW
+    fx := 0, fy := 0
+    if !CapCovers(x1, y1, x2, y2) {
+        try
+            return PixelSearch(&fx, &fy, x1, y1, x2, y2, colour, tol)
+        catch
+            return false
+    }
+    ; Deliberately inlined rather than calling CapAt/CapNear per pixel. This is
+    ; the hot loop - a 764x7 marker search is 5,348 pixels - and at this scale
+    ; the two function calls per pixel cost more than the comparison does.
+    ; Blue is tested first with an early exit so green and red are usually never
+    ; unpacked at all.
+    tr := (colour >> 16) & 0xFF
+    tg := (colour >> 8) & 0xFF
+    tb := colour & 0xFF
+    y := y1
+    while (y <= y2) {
+        rowBase := CapBits + ((y - CapY) * CapW - CapX) * 4
+        x := x1
+        while (x <= x2) {
+            v := NumGet(rowBase + x * 4, 0, "UInt")
+            if (Abs((v & 0xFF) - tb) <= tol
+                && Abs(((v >> 8) & 0xFF) - tg) <= tol
+                && Abs(((v >> 16) & 0xFF) - tr) <= tol) {
+                fx := x, fy := y
+                return true
+            }
+            x++
+        }
+        y++
+    }
+    return false
+}
+
+FindIn(box, colour, tol, &fx, &fy) {
+    return SearchBox(SX(box[1]), SY(box[2]), SX(box[3]), SY(box[4]),
+                     colour, tol, &fx, &fy)
+}
+
+; Find the fish marker in ONE pass: a pixel that is both inside the colour cube
+; and blue-leading. The two tests are applied to the same pixel as it is read.
+;
+; This exists because the colour cube alone has a lot of company. COL_FISH is
+; RGB(72,79,96) at variation 24, i.e. R 48..96, G 55..103, B 72..120 - and the
+; reel bar's OFF-TARGET grey, measured live at about RGB(85,76,77), sits inside
+; that box on every channel. The blue-leading rule rejects it correctly, but the
+; old search could only ask the cube question: it found a candidate, verified it
+; separately, and on a reject stepped the cursor 2 px and tried again, six times
+; total. Six attempts two pixels apart is twelve pixels of a 232 px bar, so once
+; the bar went grey the budget was gone long before the real marker was reached.
+;
+; Measured: the marker is actually on screen in 81 of 83 reeling frames (2.4%
+; missing), while the loop above reported it missing on 29.4% of ticks. The
+; dropouts were ours, and they were worst when the fish was OUTSIDE the bar -
+; precisely when its position matters most.
+SearchFish(x1, y1, x2, y2, colour, tol, &fx, &fy) {
+    global CapBits, CapX, CapY, CapW
+    fx := 0, fy := 0
+    tr := (colour >> 16) & 0xFF
+    tg := (colour >> 8) & 0xFF
+    tb := colour & 0xFF
+    if CapCovers(x1, y1, x2, y2) {
+        y := y1
+        while (y <= y2) {
+            rowBase := CapBits + ((y - CapY) * CapW - CapX) * 4
+            x := x1
+            while (x <= x2) {
+                v := NumGet(rowBase + x * 4, 0, "UInt")
+                b := v & 0xFF
+                r := (v >> 16) & 0xFF
+                ; Blue must clearly lead red - see IsFishPixel for why.
+                if (b > r + 6 && Abs(b - tb) <= tol && Abs(r - tr) <= tol
+                    && Abs(((v >> 8) & 0xFF) - tg) <= tol) {
+                    fx := x, fy := y
+                    return true
+                }
+                x++
+            }
+            y++
+        }
+        return false
+    }
+    ; No buffer covering this box, so fall back to candidate-and-verify - but
+    ; step past each reject by one pixel with a real budget, rather than 2 px
+    ; six times.
+    cursor := x1
+    loop 400 {
+        if !SearchBox(cursor, y1, x2, y2, colour, tol, &cx, &cy)
+            return false
+        if IsFishPixel(cx, cy) {
+            fx := cx, fy := cy
+            return true
+        }
+        cursor := cx + 1
+        if (cursor > x2)
+            return false
+    }
+    return false
 }
 
 HasProgressBar() {
@@ -429,6 +728,15 @@ HasHotbar() {
 ; Returns [x, y] of the ring's approximate centre, or 0.
 ; PixelSearch scans top-to-bottom, so the first hit sits near the ring's top
 ; edge; adding ringOffsetY lands inside the button.
+; The ring is now DIAGNOSTIC ONLY - the shake is answered by spamming Enter
+; instead (see SpamShake), so nothing in the fishing loop depends on finding it.
+;
+; It is kept because selftest, doctor and ctrltest report it, and because it is
+; still useful for calibration. But it must not gate anything: measured in
+; BOX_RING at an underwater location, 63,303 pixels of cyan scenery satisfy this
+; colour test against 1,801 for the real prompt, and there white and near-black
+; are just as polluted (5,894 and 73,870), so no colour signature separates the
+; prompt from the background there at all.
 FindShakeRing() {
     global BOX_RING, COL_RING, Cfg
     if FindIn(BOX_RING, COL_RING, Cfg["tolRing"], &x, &y) {
@@ -463,6 +771,35 @@ HasCaption() {
 ;   left edge  = first non-dark pixel scanning the track band
 ;   right edge = first dark pixel after that
 ; Both states are handled by one pair of searches, and the CENTRE falls out.
+; Walk right from the zone's left edge to its right edge, reading the capture
+; buffer directly. Returns the last non-track x, or 0.
+;
+; Cheap because the track band IS inside the captured region, so each read is a
+; buffer lookup rather than a screen access - about 0.16 ms for a 466 px bar.
+; The same walk over BOX_RING would be impossible, which is why the shake ring
+; is judged with whole-box searches instead.
+;
+; The bar's own furniture does not break the walk: the two arrow glyphs render
+; at RGB(132,133,135) and the fish marker at (67,75,91), and all of those are
+; comfortably "not track". Only the antialiased seams between them are, and they
+; measure 2-10 px, so the gap tolerance steps over them.
+MeasureZoneRight(lo, right) {
+    global Cfg
+    gapAllow := SW(Cfg["zoneGapPx"])
+    lastSolid := lo
+    gap := 0
+    x := lo
+    while (x < right) {
+        x++
+        if PixelIsNotTrack(x) {
+            lastSolid := x
+            gap := 0
+        } else if (++gap > gapAllow)
+            break
+    }
+    return lastSolid
+}
+
 FindZone(&zoneLo, &zoneHi, &zoneCentre) {
     global COL_WHITE, Cfg, NOT_TRACK_VAR, TRACK_IN_X0, TRACK_IN_X1, MarkerMode
 
@@ -509,7 +846,22 @@ FindZone(&zoneLo, &zoneHi, &zoneCentre) {
         }
 
         zoneLo := lo
-        zoneHi := Min(right, lo + width)
+        ; MEASURE the right edge; fall back to the configured width only if the
+        ; measurement fails its sanity gate.
+        ;
+        ; Three rods have now been measured with three different bar widths -
+        ; 232 px, 411 px and 466 px - so no constant can describe it, and being
+        ; wrong is not a small error. With the 232 constant on the 466 px bar the
+        ; centre came out at 688 against a true 804: 116 px adrift, enough that
+        ; `zoneSaysIn` contradicted the white on-target test on every single
+        ; frame. The bar reading was then discarded as untrusted and the loop
+        ; steered blind - with both the bar AND the fish located perfectly.
+        measured := MeasureZoneRight(lo, right)
+        span := measured - lo
+        if (measured && span >= SW(40) && span <= SW(Cfg["zoneMaxWidth"]))
+            zoneHi := measured
+        else
+            zoneHi := Min(right, lo + width)
         zoneCentre := (zoneLo + zoneHi) // 2
         y := SY(ZONE_SCAN_Y)
         NoteHit("zoneLo", zoneLo, y)
@@ -528,13 +880,31 @@ FindZone(&zoneLo, &zoneHi, &zoneCentre) {
 ; channel is above the darkness threshold.
 PixelIsNotTrack(x) {
     global ZONE_SCAN_Y, Cfg
-    try {
-        c := PixelGetColor(x, SY(ZONE_SCAN_Y))
-    } catch {
-        return false
-    }
+    ; Reads the SAME 3-row band as TrackScanX, not the single scan row, and
+    ; passes if any row in it is non-track.
+    ;
+    ; This was a single read at exactly ZONE_SCAN_Y, and measured live during a
+    ; reel that row is one of the only two in the whole bar that does NOT read
+    ; as bar. Sampling y 840..1010 while a fish was hooked, the bar showed as a
+    ; solid 232 px run on rows 904-918 and 921-946 - and was absent on 919 and
+    ; 920. ZONE_SCAN_Y is 920.
+    ;
+    ; TrackScanX never noticed because its band spans 919..921 and it matched on
+    ; 921. This function had no such luck: it read the dead row, reported "not
+    ; the bar" for a bar that was correctly located, and sent FindZone off to
+    ; step past it and retry - up to four times, then give up. A correct left
+    ; edge was being thrown away for the one reason that cannot be right.
     lim := Cfg["darkMax"]
-    return (((c >> 16) & 0xFF) > lim) && (((c >> 8) & 0xFF) > lim) && ((c & 0xFF) > lim)
+    y := SY(ZONE_SCAN_Y)
+    dy := -1
+    while (dy <= 1) {
+        c := PixelAt(x, y + dy)
+        if (c >= 0 && ((c >> 16) & 0xFF) > lim && ((c >> 8) & 0xFF) > lim
+            && (c & 0xFF) > lim)
+            return true
+        dy++
+    }
+    return false
 }
 
 ; THE on-target signal, and the most reliable reading in the whole script.
@@ -561,12 +931,10 @@ FishOnTarget(fishX) {
     rx := SW(Cfg["onTargetRx"])
     ry := SH(Cfg["onTargetRy"])
     y := SY(ZONE_SCAN_Y)
-    try {
-        if PixelSearch(&wx, &wy, fishX - rx, y - ry, fishX + rx, y + ry,
-                       COL_WHITE, Cfg["tolWhite"]) {
-            NoteHit("onTgt", wx, wy)
-            return true
-        }
+    if SearchBox(fishX - rx, y - ry, fishX + rx, y + ry,
+                 COL_WHITE, Cfg["tolWhite"], &wx, &wy) {
+        NoteHit("onTgt", wx, wy)
+        return true
     }
     NoteHit("onTgt", 0, 0)
     return false
@@ -585,11 +953,9 @@ TrackScanX(screenX1, screenX2, colour, tol, &foundX) {
     ; vertically, so this stays a "single line" in effect. (The original 45 px
     ; band was the real problem - it spanned the track's borders.)
     y := SY(ZONE_SCAN_Y)
-    try {
-        if PixelSearch(&fx, &fy, screenX1, y - 1, screenX2, y + 1, colour, tol) {
-            foundX := fx
-            return true
-        }
+    if SearchBox(screenX1, y - 1, screenX2, y + 1, colour, tol, &fx, &fy) {
+        foundX := fx
+        return true
     }
     return false
 }
@@ -658,9 +1024,8 @@ ScanForPaleMarker() {
     side := SW(24)
 
     loop 10 {
-        found := false
-        try found := PixelSearch(&x, &y, cursor, y1, right, y2,
-                                 COL_WHITE, Cfg["tolWhite"])
+        found := SearchBox(cursor, y1, right, y2,
+                           COL_WHITE, Cfg["tolWhite"], &x, &y)
         if !found
             return 0
         if (IsAchromatic(x, y) && !IsPale(x - side, y) && !IsPale(x + side, y))
@@ -673,22 +1038,18 @@ ScanForPaleMarker() {
 }
 
 IsAchromatic(x, y) {
-    try {
-        c := PixelGetColor(x, y)
-    } catch {
+    c := PixelAt(x, y)
+    if (c < 0)
         return false
-    }
     r := (c >> 16) & 0xFF, g := (c >> 8) & 0xFF, b := c & 0xFF
     return (Max(r, g, b) - Min(r, g, b)) <= 12
 }
 
 IsPale(x, y) {
     global Cfg
-    try {
-        c := PixelGetColor(x, y)
-    } catch {
+    c := PixelAt(x, y)
+    if (c < 0)
         return false
-    }
     lim := 255 - Cfg["tolWhite"]
     return (((c >> 16) & 0xFF) >= lim) && (((c >> 8) & 0xFF) >= lim)
         && ((c & 0xFF) >= lim)
@@ -707,28 +1068,18 @@ IsPale(x, y) {
 ;      returned a brown pixel 321 px off on one reference frame.
 ;
 ; With both: 3 px and 5 px error on the reference frames.
+;
+; Both tests are now applied to the same pixel in a single pass by SearchFish,
+; instead of searching on the cube and verifying the ordering afterwards. See
+; SearchFish for why the old candidate-and-retry version went blind for 29% of
+; ticks whenever the bar rendered grey.
 ScanForMarker(colour) {
     global Cfg, TRACK_IN_X0, TRACK_IN_X1, ZONE_SCAN_Y
 
-    y1 := SY(ZONE_SCAN_Y - 3)
-    y2 := SY(ZONE_SCAN_Y + 3)
-    right := SX(TRACK_IN_X1)
-    cursor := SX(TRACK_IN_X0)
-
-    ; Bounded: a candidate that fails the ordering test is stepped past. In
-    ; practice the first candidate passes, so this costs one extra read.
-    loop 6 {
-        found := false
-        try found := PixelSearch(&x, &y, cursor, y1, right, y2,
-                                 colour, Cfg["tolFish"])
-        if !found
-            return 0
-        if IsFishPixel(x, y)
-            return x
-        cursor := x + SW(2)
-        if (cursor >= right)
-            return 0
-    }
+    if SearchFish(SX(TRACK_IN_X0), SY(ZONE_SCAN_Y - 3),
+                  SX(TRACK_IN_X1), SY(ZONE_SCAN_Y + 3),
+                  colour, Cfg["tolFish"], &x, &y)
+        return x
     return 0
 }
 
@@ -736,11 +1087,9 @@ ScanForMarker(colour) {
 ; inside the same colour cube but has it the other way round, which is why the
 ; cube alone cannot separate them.
 IsFishPixel(x, y) {
-    try {
-        c := PixelGetColor(x, y)
-    } catch {
+    c := PixelAt(x, y)
+    if (c < 0)
         return false
-    }
     r := (c >> 16) & 0xFF
     b := c & 0xFF
     ; Blue must clearly lead red. Requiring B > G > R exactly also rejected
@@ -755,31 +1104,64 @@ IsFishPixel(x, y) {
 ; Ordered by how time-critical each state is, then by detector reliability.
 DetectStatus() {
     global Cfg, Status, NextCastAt, LineOut
-    ; A fish can only be hooked when there is a line in the water. Without this
-    ; guard the post-catch UI intermittently satisfies the progress-bar test, and
-    ; the state machine cascades fish_on -> idle -> bait -> fish_on about once a
-    ; second, booking a phantom hooked AND a phantom caught on every pass. One run
-    ; reported 26 hooks from 13 casts that way.
-    if (LineOut && HasProgressBar())
+    ; Both detectors, once each, so the two tests below agree on one reading.
+    onProgress := HasProgressBar()
+    onHotbar := HasHotbar()
+
+    ; A fish is being reeled if the progress bar is up AND either we believe a
+    ; line is out, or the HOTBAR IS HIDDEN.
+    ;
+    ; The LineOut half is the original guard: while idle or on the post-catch UI
+    ; the progress box intermittently satisfies its own test, and without a guard
+    ; the machine cascaded idle -> fish_on once a second, booking a phantom hook
+    ; and a phantom catch each pass - one run reported 26 hooks from 13 casts.
+    ;
+    ; The hotbar half is new, and it fixes a hang. LineOut is only set by a cast
+    ; that DoCast judged successful, and that judgement can be wrong - it infers
+    ; success from the hotbar hiding during the hold, and misses were logged as
+    ; "cast did not register" 6 times in 16. When it is wrong, LineOut stays
+    ; false, so a real fight could not satisfy the test above; meanwhile the game
+    ; hides the hotbar while reeling, so the fall-through returned "casting", and
+    ; `casting` waited for ever. The bot sat there for the whole fight.
+    ;
+    ; The game cannot show the hotbar and the reel progress bar at the same time
+    ; - doctor calls that pair a contradiction and uses it to catch miscalibrated
+    ; boxes. Turned around, the progress bar WITHOUT the hotbar is positive proof
+    ; of a fish on, and needs no belief about LineOut at all.
+    if (onProgress && (LineOut || !onHotbar))
         return "fish_on"
-    ; The ring detector is only consulted when a bite is actually possible:
-    ;   * not during a fight - one dropped read of the progress bar would
-    ;     otherwise flip fish_on -> bait, booking a phantom lost AND a phantom
-    ;     hooked for a fish still being fought, halving the reported catch rate;
-    ;   * only while a line is in the water, i.e. inside the bite window opened
-    ;     by a cast. While genuinely idle there is nothing to shake, so asking is
-    ;     pure downside - and it was measured firing on scenery in 4 of 5 bite
-    ;     states, each costing 4-10 s.
-    ; Not looking is a stronger fix than looking harder, and it is the same
-    ; approach that removed the catch caption's false positives.
-    if (Status != "fish_on" && A_TickCount < NextCastAt && FindShakeRing())
-        return "bait"
-    if !HasHotbar()
+    ; There is no `bait` state any more. Shaking is answered by spamming Enter on
+    ; a timer (see SpamShake), so the loop never has to SEE the prompt to respond
+    ; to it - which removes the whole class of ring false positives that pinned it
+    ; in `bait` and stopped it fishing. Measured in BOX_RING at an underwater
+    ; location: 63,303 scenery pixels match the ring colour against 1,801 for the
+    ; real prompt, and white and near-black are polluted there too (5,894 and
+    ; 73,870), so no colour signature could have separated them.
+    if !onHotbar
         return "casting"
     return "idle"
 }
 
 ; ---------------------------------------------------------------- helpers
+
+; Milliseconds from the high-resolution performance counter, as a float.
+;
+; A_TickCount will not do for velocity. It advances in ~15.6 ms steps while the
+; reel loop targets 10 ms, so consecutive reads frequently return the SAME value
+; and the loop cannot tell a 1 ms gap from a 15 ms one. Worse, the old code
+; advanced the position baseline on every reading but the time baseline only
+; when the tick count had changed, so displacement and interval described
+; different windows and every derivative came out biased LOW - which is exactly
+; the term that is supposed to stop the bar overshooting.
+QpcMs() {
+    static freq := 0
+    if (!freq) {
+        DllCall("QueryPerformanceFrequency", "Int64*", &f := 0)
+        freq := f
+    }
+    DllCall("QueryPerformanceCounter", "Int64*", &c := 0)
+    return c * 1000.0 / freq
+}
 
 Jitter(ms) {
     global Cfg
@@ -814,6 +1196,7 @@ LogLine(text) {
 
 DoCast() {
     global Counters, Cfg, NextCastAt, CastFailStreak, LineOut, ToggledInStreak
+    global HookedThisLine
 
     ; Aim first. The control window floats above fullscreen Roblox, so a click
     ; made while the cursor is over the GUI goes to the GUI and never reaches
@@ -868,10 +1251,38 @@ DoCast() {
     CastFailStreak := 0
     ToggledInStreak := false
     LineOut := true
+    HookedThisLine := false     ; a fresh line has caught nothing yet
     LogLine("cast #" . Counters["casts"] . " away — waiting up to "
         . Round(Cfg["biteWaitMs"] / 1000) . "s for a bite")
     Sleep Jitter(Cfg["postCastMs"])
     NextCastAt := A_TickCount + Cfg["biteWaitMs"]
+}
+
+; Spam Enter so a SHAKE prompt is answered whether or not it can be SEEN.
+;
+; Runs on its own timer for the life of a run. This replaces looking for the
+; prompt at all, because at some locations it simply cannot be found: measured
+; in BOX_RING at an underwater spot, 63,303 pixels of scenery match the ring
+; colour against 1,801 for the real prompt, and white and near-black are just as
+; polluted there (5,894 and 73,870). A detector that cannot be made reliable is
+; better removed than tuned, and Enter costs nothing when there is no prompt.
+;
+; NEVER during a reel. The reel loop owns the mouse and its own timing, and an
+; Enter mid-fight is at best noise. `Status` is "fish_on" for the whole of
+; DoReel, and a timer callback can interrupt a running function in AHK v2, so
+; that check is what keeps this out of the fight.
+SpamShake() {
+    global Running, Draining, Status, Counters
+    if (!Running || Draining)
+        return
+    if (Status = "fish_on")
+        return
+    ; Only the front window receives keys, and stealing focus is not this
+    ; function's job.
+    if !RobloxIsFront()
+        return
+    Send "{Enter}"
+    Counters["shakes"]++
 }
 
 ; Answer a SHAKE prompt. `ring` may be 0 when the method does not need it.
@@ -922,6 +1333,12 @@ DoReel() {
     ; phantom lost/hooked pair. 8 misses is ~190 ms.
     misses := 0
     while (Running && misses < 8 && A_TickCount - guard < 90000) {
+        ; THE grab for this tick. Every detector below reads this one buffer, so
+        ; the tick costs one compositor frame instead of one per question - and
+        ; as a bonus every reading now describes the SAME instant, where before
+        ; fish position, on-target and zone edge came from frames ~8 ms apart and
+        ; could contradict each other.
+        CapGrab()
         if !HasProgressBar() {
             misses++
             Sleep Cfg["reelTickMs"]
@@ -935,19 +1352,24 @@ DoReel() {
         }
         fishX := FindFishX()
         haveZone := FindZone(&zLo, &zHi, &zC)
+        ; One high-resolution timestamp per tick, shared by both velocity
+        ; estimates so they describe the same instant.
+        now := QpcMs()
+        wNew := Cfg["velSmoothPct"] / 100.0
+        wOld := 1.0 - wNew
         if (haveZone) {
-            tNow := A_TickCount
-            if (LastZoneX && LastZoneAt && tNow > LastZoneAt) {
-                dtz := tNow - LastZoneAt
+            if (LastZoneX && LastZoneAt && now > LastZoneAt) {
+                dtz := now - LastZoneAt
                 if (dtz < 400) {
                     vz := (zC - LastZoneX) * 1000 / dtz
                     ; Smooth it: single-frame edge jitter would otherwise swamp
                     ; the damping term.
-                    ZoneVel := Round(ZoneVel * 0.5 + Max(-SW(900), Min(SW(900), vz)) * 0.5)
+                    ZoneVel := Round(ZoneVel * wOld
+                        + Max(-SW(900), Min(SW(900), vz)) * wNew)
                 }
             }
             LastZoneX := zC
-            LastZoneAt := tNow
+            LastZoneAt := now
         }
         ; With a pale marker the white test would match the MARKER, so it would
         ; report "on target" forever. Fall back to geometry, which needs no
@@ -962,12 +1384,11 @@ DoReel() {
         if onTarget
             ReelOnTicks++
         if (LastTickAt) {
-            ReelPeriodMs += A_TickCount - LastTickAt
+            ReelPeriodMs += now - LastTickAt
             ReelPeriodN++
         }
-        LastTickAt := A_TickCount
+        LastTickAt := now
 
-        now := A_TickCount
         if (fishX) {
             ; Estimate the fish's speed from the previous reading, then aim at
             ; where it is GOING rather than where it is. Measured: the fish
@@ -982,7 +1403,14 @@ DoReel() {
                 ; tick. One bad reading produced a -5081 px/s spike in the trace.
                 if (dt < 400 && jump < SW(300)) {
                     v := (fishX - LastFishX) * 1000 / dt
-                    FishVel := Max(-SW(600), Min(SW(600), v))
+                    ; REJECT an implausible speed rather than clamping it. The
+                    ; old code saturated to +/-600 px/s and fed that into the
+                    ; lead term, so a 299 px misdetection - which passes the jump
+                    ; gate above - still bought ~42 px of aim in the WRONG
+                    ; direction. A reading that fails the sanity test carries no
+                    ; information, so the previous estimate is kept instead.
+                    if (Abs(v) <= SW(600))
+                        FishVel := Round(FishVel * wOld + v * wNew)
                 }
             }
             LastFishX := fishX
@@ -1000,7 +1428,15 @@ DoReel() {
             aimX := Max(SX(TRACK_IN_X0), Min(SX(TRACK_IN_X1), aimX))
         }
 
-        halfW := SW(Cfg["zoneWidth"]) // 2
+        ; Half-width comes from the zone DETECTED this frame, not a constant.
+        ; This line used zoneWidth unconditionally while FindZone switches to
+        ; zoneWidthPale on the second rod skin, so on that rod halfW was 116 px
+        ; against a real half-width of ~205. zoneSaysIn and onTarget then
+        ; disagreed for any fish 116-205 px off centre, the bar reading was
+        ; discarded as untrusted, and the loop fell into the blind probe branch
+        ; with both the bar and the fish located perfectly. Measuring it also
+        ; means a third rod skin needs no new constant here.
+        halfW := haveZone ? (zHi - zLo) // 2 : SW(Cfg["zoneWidth"]) // 2
         ; The bar's position is only trusted when it AGREES with the white test.
         ; The white test is the arbiter: it has not been wrong in any measurement
         ; so far, whereas the bar search still mis-reads some scenes. When the two
@@ -1024,6 +1460,17 @@ DoReel() {
         zoneTrusted := (zoneAgrees
             && (!OffSince || A_TickCount - OffSince < Cfg["distrustMs"]))
 
+        ; STOPPING DISTANCE, shared by both steering branches below.
+        ;
+        ; The band a command should reverse within is not a constant: it is how
+        ; far the fish and the bar will keep converging before the reversal takes
+        ; effect. Closing slowly, that is almost nothing and the loop can push
+        ; right up to the edge; closing at a dart, it is most of the bar's own
+        ; half-width, and reversing at a fixed 25 px is far too late.
+        closeVel := FishVel - ZoneVel
+        deadPx := Max(SW(Cfg["reelDeadPx"]),
+                      Round(Abs(closeVel) * Cfg["stopTimeMs"] / 1000))
+
         if (onTarget) {
             ; The game is telling us the fish is inside the bar. The only job
             ; now is to stay there.
@@ -1034,14 +1481,25 @@ DoReel() {
                 aim := aimX + Round(FishVel * Cfg["reelLeadMs"] / 1000)
                 lead := zC + Round(ZoneVel * Cfg["reelDampMs"] / 1000)
                 err := aim - lead
-                deadPx := SW(Cfg["reelDeadPx"])
                 if (err > deadPx)
                     HoldMouse()
                 else if (err < -deadPx)
                     ReleaseMouse()
-                ; Inside the dead zone the button is left alone - but note this
-                ; does NOT hold position, it lets the bar keep running at ~385
-                ; px/s, which is why the band is only one tick of travel wide.
+                ; INSIDE the band, still pick a side - never leave the button
+                ; alone. There is no neutral here: releasing does not hold
+                ; position, it lets the bar run left at ~385 px/s. So inside the
+                ; band the job switches from closing the gap to holding the gap
+                ; steady, which means cancelling the RELATIVE velocity: drive
+                ; right while the fish is pulling right of the bar, and let the
+                ; bar fall back when it is not.
+                ;
+                ; The earlier version idled here, which was safe only because
+                ; the band was a couple of pixels wide. Any speed-scaled band
+                ; makes idling a long uncontrolled drift instead.
+                else if (closeVel > 0)
+                    HoldMouse()
+                else
+                    ReleaseMouse()
             } else {
                 ; Scoring, but the bar's position is unknown. Alternate so it
                 ; hovers instead of drifting off one side.
@@ -1118,7 +1576,7 @@ DoReel() {
 ; only time the catch caption is read at all - so a bright patch of scenery in
 ; the caption box cannot be mistaken for a catch, because nothing is looking.
 ResolveReel(canSee := true) {
-    global Counters, Cfg, ResolvePend, ResolveUntil, LineOut
+    global Counters, Cfg, ResolvePend, ResolveUntil, LineOut, HookedThisLine
     if !ResolvePend
         return
     ; The caption can only be read while Roblox is actually on screen.
@@ -1126,6 +1584,7 @@ ResolveReel(canSee := true) {
         Counters["caught"]++
         ResolvePend := false
         LineOut := false
+        HookedThisLine := false
         LogLine("caught it (" . Counters["caught"] . " landed of "
             . Counters["hooked"] . " hooked)")
         return
@@ -1133,6 +1592,7 @@ ResolveReel(canSee := true) {
     if (A_TickCount >= ResolveUntil) {
         ResolvePend := false
         LineOut := false
+        HookedThisLine := false
         if canSee {
             Counters["lost"]++
             LogLine("lost it (" . Counters["lost"] . " lost of "
@@ -1150,13 +1610,14 @@ ResolveReel(canSee := true) {
 ; Abandon any fish currently in flight, without guessing its outcome. Used when a
 ; run stops or the loop is interrupted mid-fight.
 DropPendingFish(why) {
-    global Counters, Status, ResolvePend, LineOut
+    global Counters, Status, ResolvePend, LineOut, HookedThisLine
     if (ResolvePend || Status = "fish_on") {
         Counters["unresolved"]++
         ResolvePend := false
         LogLine("unresolved (" . why . ")")
     }
     LineOut := false
+    HookedThisLine := false
     Status := ""
 }
 
@@ -1164,10 +1625,15 @@ DropPendingFish(why) {
 
 MainTick() {
     global Running, Status, PrevStatus, Counters, Cfg, StatusSince, NextCastAt
-    global LastOvlAt, ResolvePend, ResolveUntil, Draining
+    global LastOvlAt, ResolvePend, ResolveUntil, Draining, CapFresh
+    global HookedThisLine
 
     if !Running
         return
+    ; Invalidate last tick's grab. DoReel leaves it fresh when it returns, and
+    ; the progress box sits INSIDE the captured area, so without this the state
+    ; machine would judge a new tick from the previous one's pixels.
+    CapFresh := false
     if !RefreshGeometry() {
         SetStatus("no game window")
         return
@@ -1199,23 +1665,31 @@ MainTick() {
             ResolvePend := true
             ResolveUntil := A_TickCount + Cfg["resolveMs"]
         }
-        if (s = "bait") {
-            LogLine("bite — shaking")
-            ; NextCastAt is deliberately left alone. Zeroing it here discarded
-            ; the bite-wait guard, so a false bite let the loop re-cast while its
-            ; line was still out - and a second cast cancels the first. A real
-            ; bite ends the wait on its own when fish_on arrives.
-        }
         if (s = "fish_on") {
             NextCastAt := 0
-            ; A new fight starting while the last one is still unjudged means the
-            ; last one got away without a caption.
-            if ResolvePend {
-                Counters["lost"]++
-                ResolvePend := false
-            }
-            Counters["hooked"]++
-            LogLine("hooked — reeling")
+            ; Re-entering the reel on the SAME line is one fish continuing, not a
+            ; new one. Fisch keeps the catch-progress bar up through the shake
+            ; phase, so a single fish goes bait -> fish_on -> bait -> fish_on
+            ; several times before it lands. Measured in a live log: every
+            ; "lost" fish was a 2-second reel followed by more shaking, while
+            ; every landed one reeled for ~10 s uninterrupted. Booking a hook per
+            ; transition counted one fish as several, and wrote each unfinished
+            ; leg off as a loss - so the reported catch rate was wrong, and
+            ; wrong DOWNWARD, hiding fish that were actually landed.
+            ;
+            ; Give the caption a read first: if it HAS rendered, the previous
+            ; fish really did land and this is a genuinely new one.
+            if ResolvePend
+                ResolveReel()
+            ; Still pending means no caption, i.e. the same fish is resuming.
+            ; Cancel the pending judgement rather than calling it a loss.
+            ResolvePend := false
+            if !HookedThisLine {
+                HookedThisLine := true
+                Counters["hooked"]++
+                LogLine("hooked — reeling")
+            } else
+                LogLine("reeling again (same fish)")
         }
         ; Leaving a reel: let the game finish landing the fish before re-casting.
         if (Status = "fish_on" && s != "fish_on")
@@ -1229,11 +1703,6 @@ MainTick() {
     switch s {
         case "fish_on":
             DoReel()
-        case "bait":
-            ; The ring still gates the response - only answer a prompt that is
-            ; actually on screen - but with Enter its exact position no longer
-            ; matters, only that it is there.
-            DoShake(FindShakeRing())
         case "idle":
             ; Do NOT cast again while a line is already in the water: a second
             ; cast cancels the first. Measured without this guard: 89 casts and
@@ -1250,8 +1719,29 @@ MainTick() {
             else
                 Sleep Cfg["tickMs"]
         case "casting":
-            ; Mid-cast and the button is already released; just wait it out.
-            Sleep Jitter(Cfg["tickMs"])
+            ; `casting` is not really a state, it is the fall-through for "the
+            ; hotbar is not where I expect it" - so a miscalibrated box, an
+            ; overlay, a menu, or the game simply looking different all land
+            ; here. It used to wait it out for ever, with nothing able to end it
+            ; but the hotbar reappearing. That is a hard hang, and it is what
+            ; "stuck at casting" was.
+            ;
+            ; A real cast animation is a second or two. Anything past the cap has
+            ; stopped being a cast, so give up on the line and start again rather
+            ; than sitting still. Note the fish_on test above now also catches a
+            ; reel whose LineOut was lost, so reaching this cap means neither the
+            ; hotbar NOR the progress bar could be seen - there is nothing left
+            ; to wait for.
+            if (StatusSince && A_TickCount - StatusSince > Cfg["castingMaxMs"]) {
+                LogLine("stuck in casting for "
+                    . Round((A_TickCount - StatusSince) / 1000) . "s — neither"
+                    . " hotbar nor progress bar visible; abandoning the line")
+                DropPendingFish("casting stalled")
+                Status := ""                    ; force a fresh transition
+                StatusSince := A_TickCount
+                NextCastAt := A_TickCount
+            } else
+                Sleep Jitter(Cfg["tickMs"])
         case "success":
             LogLine("caught one")
             Sleep Jitter(400)
@@ -1262,7 +1752,6 @@ FriendlyStatus(s) {
     switch s {
         case "idle":     return "waiting to cast"
         case "casting":  return "casting"
-        case "bait":     return "shaking"
         case "fish_on":  return "reeling in"
         case "success":  return "caught one"
     }
@@ -1332,7 +1821,16 @@ BuildGui() {
     ; --- log ---
     UI["log"] := Gui1.Add("Edit", "x8 y538 w404 h146 ReadOnly +VScroll", "")
 
-    Gui1.Show("w420 h694")
+    ; Credit where the steering ideas came from. DeepFish's licence permits
+    ; reusing parts of it on condition that Yato is credited visibly in the
+    ; using project's interface; the stopping-distance approach it uses is
+    ; itself credited there to AsphaltCake. No code was copied - that macro is
+    ; AutoHotkey v1 and this is v2 - but the ideas were read there, so the
+    ; credit belongs on screen either way.
+    Gui1.Add("Text", "x8 y688 w404 cGray",
+        "Steering approach informed by DeepFish (Yato), after AsphaltCake.")
+
+    Gui1.Show("w420 h710")
     LogLine("ready. Roblox must be in borderless fullscreen (F11) and in front.")
 }
 
@@ -1786,7 +2284,28 @@ StartRun() {
     if !ResolutionOk() {
         return
     }
+    ; The overlay and the capture path cannot both be on.
+    ;
+    ; overlayHideFromCapture keeps the overlay out of AHK's own PixelSearch, but
+    ; it does NOT keep it out of a BitBlt of the desktop DC - which is exactly
+    ; what CapGrab does. So the overlay's own rectangles land in the buffer and
+    ; are then read back as game pixels. Measured: with the overlay on, the fish
+    ; marker went unread on 34% of reel ticks and dwell sat at 64.5%; with it off
+    ; and nothing else changed, dropouts fell to 7.2% and dwell rose to 87.7%.
+    ; It cost three runs to find, so it is refused here rather than documented.
+    if (Cfg["useCapture"] && Cfg["overlay"]) {
+        Cfg["overlay"] := 0
+        if (UI.Has("overlay"))
+            UI["overlay"].Value := 0
+        OvlToggle(0)
+        LogLine("overlay turned OFF: it is captured by the reel loop's own screen"
+            . " grab and destroys fish detection. Untick 'useCapture' to use it.")
+    }
     Running := true
+    ; Enter goes out on its own timer from here until the run stops. shakeGapMs
+    ; (220 ms) is about 4.5 presses a second, which is the rate the old
+    ; detector-driven shake used.
+    SetTimer(SpamShake, Cfg["shakeGapMs"])
     ; Status is deliberately NOT blanked here: doing so destroys the
     ; fish_on -> something edge the resolver hangs off, which silently dropped a
     ; hooked fish on every stop/start. StopRun has already settled any fish.
@@ -1814,6 +2333,7 @@ StopRun(why := "stopped") {
     ; A fish in flight when the loop stops has no observable outcome.
     DropPendingFish("run stopped")
     SetTimer(MainTick, 0)
+    SetTimer(SpamShake, 0)
     ReleaseMouse()
     UI["start"].Text := "Start (F9)"
     SetStatus(why)
