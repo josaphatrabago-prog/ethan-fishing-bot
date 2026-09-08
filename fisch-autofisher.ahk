@@ -77,6 +77,46 @@ ZONE_SCAN_Y  := 920
 ; Measured over 8 frames: 221 px on a real catch, 0 on everything else.
 BOX_CAPTION  := [915,  840, 1035,  885]   ; centre of the catch caption -> success
 
+; --- Pinion's Aria -----------------------------------------------------------
+; This rod redraws the whole reel UI. Measured on screenshots/aria1..6.png
+; (laptop captures; the user reports the bar sits where it always does on the
+; calibrated machine and only the colours differ):
+;   track  pale lavender, blue channel 186..217 - NOT near-black, so darkMax
+;          cannot tell the zone from the track on it.
+;   zone   lit pale blue/pink (blue >= 251) while the fish is inside; dim mauve
+;          (blue <= 162) or red (blue ~81) while it is not. 205..302 px wide,
+;          and the width CHANGES mid-fight as notes are caught or missed.
+;   fish   an 8 px column fading cyan (top) to purple (bottom). Its top rows are
+;          the only cyan-bright thing on the bar: R <= 160, G >= 190, B >= 235
+;          matched the marker and nothing else on 6/6 frames.
+;   notes  pale lavender glyphs (B >= 245, G >= 190, R 165..215) that fall
+;          straight down within the track's width and land on the bar. Every
+;          glyph has a row at least 13 px wide; every false match (the feather
+;          drawn over the fish, caught-note sparkles) is 9 px or narrower.
+ARIA_FISH_Y0 := 898        ; rows scanned for the marker's cyan top; the rule
+ARIA_FISH_Y1 := 906        ; held on rows 890..916 in every frame
+ARIA_LANE_Y0 := 0          ; notes are looked for from the top of the screen...
+ARIA_LANE_Y1 := 888        ; ...down to just above the bar
+ARIA_LAND_Y  := 880        ; a note read this low is about to hit the bar (ETA 0)
+ARIA_LOW_Y   := 700        ; below this a note is landing: judge cover here
+ARIA_END_INSET := 8        ; track-colour samples sit this far inside the ends
+; The four colour rules, each in exactly one place. Copied into locals inside
+; the hot loops, which is how the rest of this file keeps per-pixel cost down.
+ARIA_CYAN_R_MAX := 160     ; fish marker top
+ARIA_CYAN_G_MIN := 190
+ARIA_CYAN_B_MIN := 235
+ARIA_LIT_B_MIN  := 240     ; the zone while the fish is inside it
+ARIA_NOTE_B_MIN := 245     ; note glyph
+ARIA_NOTE_G_MIN := 190
+ARIA_NOTE_R_MIN := 165
+ARIA_NOTE_R_MAX := 215
+ARIA_NOTE_MIN_PX := 11     ; narrowest full-resolution run accepted as a glyph
+ARIA_NOTE_STRIDE_X := 3    ; lane sampling grid: a glyph is >= 13 px wide...
+ARIA_NOTE_STRIDE_Y := 8    ; ...and >= 15 px tall where it is that wide
+ARIA_NOTE_TTL_MS := 150    ; a note unseen this long has landed or vanished
+ARIA_FULL_SCAN_EVERY := 3  ; one whole-lane scan per this many ticks while
+                           ; a note is being followed
+
 ; Colours are v2 RGB. NEVER paste a colour from an AHK v1 example: v1 was BGR,
 ; so red and blue are swapped and the match silently never fires.
 COL_WHITE := 0xFFFFFF   ; UI chrome. var 40 => every channel >= 215.
@@ -91,6 +131,11 @@ COL_FISH_LIT  := 0xA8AEBC   ; bright/daylight scenes
 ; frames - so "dark" is a dependable way to find where the zone is NOT.
 ; MEASURED value, not guessed: median RGB (34, 18, 29) across 314 reeling frames.
 COL_TRACK     := 0x22121D
+; Pinion's Aria paints the progress FILL red while progress is being lost.
+; Measured #E06A6F (aria3.png); its green of 106 is under the 120 the bright
+; test needs, so without a second rule the fight was declared over eight ticks
+; into every bad patch.
+COL_ARIA_RED  := 0xE06A6F
 ; "Not the track" expressed as a PixelSearch: hunting white with variation 225
 ; matches any pixel whose every channel is >= 30. Measured separations on the
 ; scan row: track min-channel 4..8, fish bar ~37, warm zone ~44, white zone 215+.
@@ -122,7 +167,8 @@ INI_FILE  := A_ScriptDir . "\fisch-autofisher.ini"
 ;     shakeMaxMs are all gone.
 ; 15: added castingMaxMs. fish_on no longer needs LineOut when the hotbar is
 ;     hidden, which is what let a reel go unseen and hang in `casting`.
-SETTINGS_VERSION := 15
+; 16: added the aria* keys for Pinion's Aria (pale track, falling notes).
+SETTINGS_VERSION := 16
 
 ; ---------------------------------------------------------------- state
 
@@ -208,6 +254,33 @@ global Cfg := Map(
     ; The coloured-bar rod's bar is much wider. Selected by which marker is in
     ; use, because there is no cheap way to measure the right edge every tick.
     "zoneWidthPale",   411,
+    ; --- Pinion's Aria (the ARIA_ constants describe what is measured) ---
+    ; 1 = steer for the falling notes on Pinion's Aria; 0 = track the fish only.
+    "ariaNotes",         1,
+    ; The track's blue channel is sampled just inside both ends of the bar every
+    ; tick, and a sample is accepted as track only inside this window. Measured
+    ; 186..217 across six frames; the dim zone tops out at 162 and the lit zone
+    ; starts at 251, so both margins are 10+ counts.
+    "ariaTrackBlueLo", 172,
+    "ariaTrackBlueHi", 232,
+    ; A bar pixel is track when its blue is within [-down, +up] of that sample.
+    ; Asymmetric because the dim zone sits BELOW the track (24 counts under it)
+    ; and the lit zone far above (47+), while the anti-aliased ramps between
+    ; track and zone (218..230) are better counted as track than as zone.
+    "ariaTrackTolDown", 14,
+    "ariaTrackTolUp",   30,
+    ; Keep a landing note at least this far inside the bar's edge.
+    "ariaNoteMarginPx", 20,
+    ; Commit the bar to a note this many ms before the travel time alone says it
+    ; must. Early costs fish-tracking time; late misses the note.
+    "ariaNoteLeadMs",  400,
+    ; How fast the bar is assumed to travel when planning that move, px/s.
+    ; Measured 198 held / 207 released on the default rod; deliberately low so
+    ; the plan errs on the early side.
+    "ariaBarPxS",      180,
+    ; Fall speed assumed for a note until one has been timed live, px/s.
+    ; Replaced by the measured value ~120 ms into following the first note.
+    "ariaNoteFallPxS", 400,
     ; "bright" rather than "white": PixelSearch on 0xFFFFFF with this variation
     ; matches any pixel whose channels are all >= 255 - tol. At 135 that is
     ; >= 120, which catches a coloured progress bar as well as a white one, and
@@ -338,9 +411,21 @@ global LastZoneX    := 0
 global LastFishX    := 0
 global LastFishSeen := 0   ; most recent fish x, for the zone search
 ; Which marker rendering this fight is using. 0 = not yet known, 1 = blue-grey
-; (white bar), 2 = pale grey (coloured bar). Latched to 1 the first time the
-; blue-grey rule succeeds, so the pale pass can never match a white bar.
+; (white bar), 2 = pale grey (coloured bar), 3 = Pinion's Aria (cyan-topped
+; marker on a pale track). Latched to 1 the first time the blue-grey rule
+; succeeds, so the pale pass can never match a white bar; latched to 3 by the
+; track test before either of those is tried.
 global MarkerMode   := 0
+; --- Pinion's Aria ---
+global AriaTrackB   := 0      ; this tick's sampled track blue; 0 = not sampled
+global CapTall      := false  ; grab the note lane as well as the bar strip
+; The note being followed: where it is, where and when it was first seen (for
+; the fall-speed measurement), and whether it got low enough to be judged.
+global NoteX := 0, NoteY := 0, NoteSeenAt := 0, NoteY0 := 0, NoteT0 := 0
+global NoteLow := false, NoteCovered := false
+global NoteFallPxS  := 0      ; measured fall speed, screen px/s; 0 until timed
+global NotesLanded  := 0, NotesCovered := 0   ; this fight's tally
+global AriaScanTick := 0
 global SettingsKept  := []     ; keys the user tuned, kept across a version bump
 global SettingsMoved := []     ; keys reset because only the shipped default changed
 global SettingsReset := false  ; true when provenance was unknown and tuning was dropped
@@ -503,13 +588,22 @@ CapInit() {
     global CapBits, CapDC, CapBM, CapOldBM, CapScreenDC
     global CapX, CapY, CapW, CapH
     global BOX_PROGRESS, TRACK_IN_X0, TRACK_IN_X1, BOX_TRACK
+    global ARIA_FISH_Y0, ARIA_LANE_Y0, CapTall
 
     CapFree()
-    ; Union of the progress box and the track band, in screen coords.
+    ; Union of the progress box and the track band, in screen coords. The few
+    ; rows above the bar where Pinion's Aria's marker is read come along too;
+    ; they cost nothing.
     x1 := Min(SX(BOX_PROGRESS[1]), SX(TRACK_IN_X0), SX(BOX_TRACK[1]))
-    y1 := Min(SY(BOX_PROGRESS[2]), SY(BOX_TRACK[2]))
+    y1 := Min(SY(BOX_PROGRESS[2]), SY(BOX_TRACK[2]), SY(ARIA_FISH_Y0))
     x2 := Max(SX(BOX_PROGRESS[3]), SX(TRACK_IN_X1), SX(BOX_TRACK[3]))
     y2 := Max(SY(BOX_PROGRESS[4]), SY(BOX_TRACK[4]))
+    ; Pinion's Aria: the falling notes are read from the whole column above the
+    ; bar, so once that rod is identified the grab grows to include it. A
+    ; BitBlt costs one compositor frame however large it is - only the reading
+    ; is paid per pixel, and the lane is sampled on a coarse grid (AriaScanLane).
+    if CapTall
+        y1 := Min(y1, SY(ARIA_LANE_Y0))
     CapX := x1, CapY := y1
     CapW := x2 - x1 + 1, CapH := y2 - y1 + 1
     if (CapW < 1 || CapH < 1)
@@ -570,6 +664,19 @@ CapCovers(x1, y1, x2, y2) {
     global CapFresh, CapX, CapY, CapW, CapH
     return CapFresh && x1 >= CapX && y1 >= CapY
         && x2 <= CapX + CapW - 1 && y2 <= CapY + CapH - 1
+}
+
+; Make the buffer cover a box, grabbing now if this tick has not. For the
+; Pinion's Aria detectors, which walk hundreds of pixels and would take seconds
+; through PixelGetColor - so they are buffer-only, and simply report "nothing"
+; when capture is switched off.
+EnsureCap(x1, y1, x2, y2) {
+    global Cfg
+    if CapCovers(x1, y1, x2, y2)
+        return true
+    if !Cfg["useCapture"]
+        return false
+    return CapGrab() && CapCovers(x1, y1, x2, y2)
 }
 
 ; The pixel at screen (sx, sy) as 0xRRGGBB, matching PixelGetColor. The DIB is
@@ -703,11 +810,19 @@ SearchFish(x1, y1, x2, y2, colour, tol, &fx, &fy) {
 }
 
 HasProgressBar() {
-    global BOX_PROGRESS, COL_WHITE, Cfg
+    global BOX_PROGRESS, COL_WHITE, COL_ARIA_RED, Cfg, MarkerMode
     ; BRIGHT, not white - the progress bar is white on one rod and a pink-to-
     ; purple gradient on another. Measured: 350 px and 330 px respectively, and
     ; 0 on every frame where no fight is running.
     if FindIn(BOX_PROGRESS, COL_WHITE, Cfg["tolProgress"], &x, &y) {
+        NoteHit("progress", x, y)
+        return true
+    }
+    ; Pinion's Aria turns the fill RED while progress is being lost (see
+    ; COL_ARIA_RED). Only believed once this fight has been identified as that
+    ; rod: a fight always starts with a bright fill, and red scenery in the box
+    ; must never be able to start a phantom one.
+    if (MarkerMode = 3 && FindIn(BOX_PROGRESS, COL_ARIA_RED, 60, &x, &y)) {
         NoteHit("progress", x, y)
         return true
     }
@@ -802,6 +917,7 @@ MeasureZoneRight(lo, right) {
 
 FindZone(&zoneLo, &zoneHi, &zoneCentre) {
     global COL_WHITE, Cfg, NOT_TRACK_VAR, TRACK_IN_X0, TRACK_IN_X1, MarkerMode
+    global AriaTrackB
 
     zoneLo := zoneHi := zoneCentre := 0
     left := SX(TRACK_IN_X0)
@@ -809,6 +925,13 @@ FindZone(&zoneLo, &zoneHi, &zoneCentre) {
     ; The two rod skins have very different bar widths, and the marker in use
     ; identifies which one this is.
     width := SW(MarkerMode = 2 ? Cfg["zoneWidthPale"] : Cfg["zoneWidth"])
+    ; Pinion's Aria: "track" is a colour to be sampled this tick, not a darkness.
+    ; Without a sample every pixel would read as zone, so give up instead.
+    if (MarkerMode = 3) {
+        AriaTrackB := AriaSampleTrackBlue()
+        if !AriaTrackB
+            return false
+    }
 
     ; Only the LEFT EDGE is detected; the width is known, so the rest follows.
     ;
@@ -822,7 +945,10 @@ FindZone(&zoneLo, &zoneHi, &zoneCentre) {
     cursor := left
 
     loop 4 {
-        if !TrackScanX(cursor, right, COL_WHITE, NOT_TRACK_VAR, &lo)
+        found := (MarkerMode = 3)
+            ? AriaScanLeft(cursor, right, &lo)
+            : TrackScanX(cursor, right, COL_WHITE, NOT_TRACK_VAR, &lo)
+        if !found
             return false
 
         ; The fish marker is also "not track". If the edge we found is really
@@ -879,7 +1005,7 @@ FindZone(&zoneLo, &zoneHi, &zoneCentre) {
 ; True when the pixel on the scan row is NOT the near-black track, i.e. every
 ; channel is above the darkness threshold.
 PixelIsNotTrack(x) {
-    global ZONE_SCAN_Y, Cfg
+    global ZONE_SCAN_Y, Cfg, MarkerMode, AriaTrackB
     ; Reads the SAME 3-row band as TrackScanX, not the single scan row, and
     ; passes if any row in it is non-track.
     ;
@@ -895,13 +1021,26 @@ PixelIsNotTrack(x) {
     ; step past it and retry - up to four times, then give up. A correct left
     ; edge was being thrown away for the one reason that cannot be right.
     lim := Cfg["darkMax"]
+    ; Pinion's Aria: the track is pale, so "dark" says nothing here. Its blue
+    ; channel is the discriminator instead - anything outside the band around
+    ; this tick's track sample is zone (or the fish, or a landing note, all of
+    ; which are "not track" for this purpose too). See the ARIA_ notes.
+    aria := (MarkerMode = 3 && AriaTrackB)
+    blueLo := AriaTrackB - Cfg["ariaTrackTolDown"]
+    blueHi := AriaTrackB + Cfg["ariaTrackTolUp"]
     y := SY(ZONE_SCAN_Y)
     dy := -1
     while (dy <= 1) {
         c := PixelAt(x, y + dy)
-        if (c >= 0 && ((c >> 16) & 0xFF) > lim && ((c >> 8) & 0xFF) > lim
-            && (c & 0xFF) > lim)
-            return true
+        if (c >= 0) {
+            if aria {
+                b := c & 0xFF
+                if (b < blueLo || b > blueHi)
+                    return true
+            } else if (((c >> 16) & 0xFF) > lim && ((c >> 8) & 0xFF) > lim
+                && (c & 0xFF) > lim)
+                return true
+        }
         dy++
     }
     return false
@@ -940,6 +1079,50 @@ FishOnTarget(fishX) {
     return false
 }
 
+; On-target on Pinion's Aria. The same idea as FishOnTarget - read the game's
+; own scoring colour next to the fish - but the lit zone is pale blue rather
+; than white (blue >= 240; the track never exceeds 217 and the dim zone 162),
+; and the marker column is that blue itself, so the reading is taken just
+; OUTSIDE it: a short run starting onTargetRx from the marker's centre, either
+; side, on three rows. The run is 6 px because the zone's own end-caps are 4 px
+; of the same blue, and a fish parked just outside the bar must not read as in.
+AriaFishOnTarget(fishX) {
+    global ZONE_SCAN_Y, Cfg
+    if !fishX {
+        NoteHit("onTgt", 0, 0)
+        return false
+    }
+    centre := fishX + SW(4)        ; the marker is 8 px wide; fishX is its left edge
+    rx := SW(Cfg["onTargetRx"])
+    ry := SH(Cfg["onTargetRy"])
+    span := SW(6)
+    y := SY(ZONE_SCAN_Y)
+    for side in [-1, 1] {
+        x0 := (side < 0) ? centre - rx - span + 1 : centre + rx
+        for dy in [-ry, 0, ry] {
+            if AriaLitRun(x0, x0 + span - 1, y + dy) {
+                NoteHit("onTgt", x0, y + dy)
+                return true
+            }
+        }
+    }
+    NoteHit("onTgt", 0, 0)
+    return false
+}
+
+; True when every pixel of the row segment is lit-zone blue.
+AriaLitRun(x1, x2, y) {
+    global ARIA_LIT_B_MIN
+    x := x1
+    while (x <= x2) {
+        c := PixelAt(x, y)
+        if (c < 0 || (c & 0xFF) < ARIA_LIT_B_MIN)
+            return false
+        x++
+    }
+    return true
+}
+
 ; Horizontal search along ONE scan line. Takes and returns SCREEN x.
 ; Single-line is essential: a multi-row rectangle makes left-to-right
 ; bracketing meaningless, because a match may come from any row.
@@ -975,7 +1158,23 @@ TrackScanX(screenX1, screenX2, colour, tol, &foundX) {
 ;
 ; With both: 3 px and 5 px error on the reference frames.
 FindFishX() {
-    global COL_FISH, COL_FISH_LIT, LastFishSeen, MarkerMode
+    global COL_FISH, COL_FISH_LIT, LastFishSeen, MarkerMode, ARIA_FISH_Y0
+
+    ; Pinion's Aria first. Its pale track is a two-pixel test and unmistakable,
+    ; and neither rule below can match anything on it (see AriaFindFishX), so
+    ; on every other rod this costs two reads and changes nothing.
+    if (MarkerMode = 0 && AriaTrackVisible())
+        AriaBegin()
+    if (MarkerMode = 3) {
+        x := AriaFindFishX()
+        if x {
+            NoteHit("fish", x, SY(ARIA_FISH_Y0 + 4))
+            LastFishSeen := x
+            return x
+        }
+        NoteHit("fish", 0, 0)
+        return 0
+    }
 
     ; The marker has two renderings - a dark blue-grey and a lighter one. Trying
     ; the dark one first costs nothing when it hits, which is the common case.
@@ -1098,6 +1297,327 @@ IsFishPixel(x, y) {
     ; brown false match measured - (106,74,68), (103,73,67), (87,73,69) - fails
     ; this just as decisively.
     return (b > r + 6)
+}
+
+; =============================================================================
+;  Pinion's Aria
+;
+;  A rod whose reel UI shares nothing with the others - see the ARIA_ constants
+;  for what was measured - and which adds a second game on top of the first:
+;  musical notes fall from the top of the screen and are "caught" when the bar
+;  is under them as they reach it (research: .scratch/fisch-autofisher/findings/
+;  21-pinion-aria-rod.md). Catching one widens the bar and speeds progress up,
+;  missing one does the reverse, and seven in a row lock the fish to the bar.
+;
+;  Everything here is buffer-only (EnsureCap): these detectors walk hundreds of
+;  pixels per tick, which through PixelGetColor would take seconds.
+; =============================================================================
+
+; Is this Pinion's Aria? Its track is pale where every other rod's is near-
+; black: one end of the bar reads as Aria track AND the other end is not dark
+; either. On Aria the other end is track, or the zone - whose darkest channel
+; reads 126+ when dim and 168+ when lit. (The red zone's reads 70, so that tick
+; simply fails; the test is repeated every tick until something latches, and
+; the bar moves.) The second condition is what stops the coloured second skin's
+; bar, parked at one end of its own dark track, from passing - that track's
+; darkest channel measured 17..70.
+AriaTrackVisible() {
+    global TRACK_IN_X0, TRACK_IN_X1, ZONE_SCAN_Y, ARIA_END_INSET
+    y := SY(ZONE_SCAN_Y)
+    a := PixelAt(SX(TRACK_IN_X0 + ARIA_END_INSET), y)
+    b := PixelAt(SX(TRACK_IN_X1 - ARIA_END_INSET), y)
+    if (a < 0 || b < 0)
+        return false
+    return (AriaIsTrackSample(a) && MinChannel(b) >= 100)
+        || (AriaIsTrackSample(b) && MinChannel(a) >= 100)
+}
+
+; A pixel that could be Pinion's Aria's track: blue inside the accepted window
+; and pale on the other two channels.
+AriaIsTrackSample(c) {
+    global Cfg
+    blue := c & 0xFF
+    return blue >= Cfg["ariaTrackBlueLo"] && blue <= Cfg["ariaTrackBlueHi"]
+        && ((c >> 16) & 0xFF) >= 120 && ((c >> 8) & 0xFF) >= 120
+}
+
+MinChannel(c) => Min((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)
+
+; The track's blue this tick, sampled just inside both ends of the bar. The zone
+; can cover one end but never both (it is at most 560 of 764 px), so at least
+; one sample is real track; a sample outside the window is the zone and is
+; dropped. Sampled per tick rather than fixed because the track's brightness
+; drifted by 20+ counts between reference frames (blue 191 in one, 213 in
+; another) while the zone stayed 35+ counts away on either side of it.
+; Returns 0 when neither end reads as track.
+AriaSampleTrackBlue() {
+    global TRACK_IN_X0, TRACK_IN_X1, ZONE_SCAN_Y, ARIA_END_INSET
+    y := SY(ZONE_SCAN_Y)
+    sum := 0, n := 0
+    for x in [SX(TRACK_IN_X0 + ARIA_END_INSET), SX(TRACK_IN_X1 - ARIA_END_INSET)] {
+        c := PixelAt(x, y)
+        if (c >= 0 && AriaIsTrackSample(c)) {
+            sum += c & 0xFF
+            n++
+        }
+    }
+    return n ? Round(sum / n) : 0
+}
+
+; Latch Pinion's Aria for this fight and grow the capture to take in the note
+; lane. Logged because from here on every reading is taken differently.
+AriaBegin() {
+    global Cfg, MarkerMode, CapTall, NotesLanded, NotesCovered
+    MarkerMode := 3
+    AriaForgetNote()
+    NotesLanded := 0, NotesCovered := 0
+    if (!CapTall && Cfg["ariaNotes"]) {
+        CapTall := true
+        CapFree()      ; the next grab rebuilds at the new size
+    }
+    LogLine("rod identified: Pinion's Aria (pale track) - note steering "
+        . (Cfg["ariaNotes"] ? "on" : "off"))
+}
+
+; Close the books on a fight. Judges a note still in flight, reports the tally,
+; and shrinks the capture back to the bar strip if the rod turned out to be
+; something else. MarkerMode is cleared so HasProgressBar's red rule is only
+; ever live inside a fight that earned it.
+AriaEndFight() {
+    global MarkerMode, CapTall, NotesLanded, NotesCovered, NoteFallPxS
+    if (MarkerMode = 3) {
+        AriaForgetNote()
+        if NotesLanded
+            LogLine("notes: " . NotesCovered . " of " . NotesLanded
+                . " landed under the bar"
+                . (NoteFallPxS ? "  (fall speed " . NoteFallPxS . " px/s)" : ""))
+    } else if CapTall {
+        CapTall := false
+        CapFree()
+    }
+    MarkerMode := 0
+}
+
+; The zone's left edge on Pinion's Aria: the first pixel from x1 that is not
+; track-blue. The counterpart of TrackScanX, which asks "not dark".
+AriaScanLeft(x1, x2, &lo) {
+    global ZONE_SCAN_Y
+    lo := 0
+    y := SY(ZONE_SCAN_Y)
+    if !EnsureCap(x1, y - 1, x2, y + 1)
+        return false
+    x := x1
+    while (x < x2) {
+        if PixelIsNotTrack(x) {
+            lo := x
+            return true
+        }
+        x++
+    }
+    return false
+}
+
+; The fish marker on Pinion's Aria: the only cyan-bright pixels in the bar's top
+; rows (ARIA_CYAN_*). Checked on all six reference frames: the marker and
+; nothing else, bar one stray pixel - hence the 4 px minimum run. Returns the
+; run's LEFT edge, matching what SearchFish returns for the other markers. The
+; marker's lower rows fade to the zone's own lavender, which is why the scan
+; row itself is no use for this rod.
+AriaFindFishX() {
+    global TRACK_IN_X0, TRACK_IN_X1, ARIA_FISH_Y0, ARIA_FISH_Y1
+    global ARIA_CYAN_R_MAX, ARIA_CYAN_G_MIN, ARIA_CYAN_B_MIN
+    global CapBits, CapX, CapY, CapW
+    x1 := SX(TRACK_IN_X0), x2 := SX(TRACK_IN_X1)
+    y1 := SY(ARIA_FISH_Y0), y2 := SY(ARIA_FISH_Y1)
+    if !EnsureCap(x1, y1, x2, y2)
+        return 0
+    rMax := ARIA_CYAN_R_MAX, gMin := ARIA_CYAN_G_MIN, bMin := ARIA_CYAN_B_MIN
+    need := Max(2, SW(4))
+    y := y1
+    while (y <= y2) {
+        rowBase := CapBits + ((y - CapY) * CapW - CapX) * 4
+        run := 0
+        x := x1
+        while (x <= x2) {
+            v := NumGet(rowBase + x * 4, 0, "UInt")
+            if ((v & 0xFF) >= bMin && ((v >> 8) & 0xFF) >= gMin
+                && ((v >> 16) & 0xFF) <= rMax) {
+                if (++run >= need)
+                    return x - run + 1
+            } else
+                run := 0
+            x++
+        }
+        y++
+    }
+    return 0
+}
+
+; Drop the note being followed, booking it first if it had reached the landing
+; band - a note that vanishes higher up was never going to be judged.
+AriaForgetNote() {
+    global NoteX, NoteY, NoteSeenAt, NoteY0, NoteT0, NoteLow, NoteCovered
+    global NotesLanded, NotesCovered
+    if (NoteX && NoteLow) {
+        NotesLanded++
+        if NoteCovered
+            NotesCovered++
+    }
+    NoteX := 0, NoteY := 0, NoteSeenAt := 0, NoteY0 := 0, NoteT0 := 0
+    NoteLow := false, NoteCovered := false
+}
+
+; Follow the lowest falling note. Returns its x and the estimated ms until it
+; reaches the bar (both 0 when none is on screen). The out-parameters are not
+; called noteX/noteEta because AHK names are case-insensitive and those would
+; BE the NoteX/NoteY globals this function keeps its state in.
+AriaTrackNote(now, haveZone, zLo, zHi, &outX, &outEta) {
+    global Cfg, NoteX, NoteY, NoteSeenAt, NoteY0, NoteT0, NoteLow, NoteCovered
+    global NoteFallPxS, ARIA_LAND_Y, ARIA_LOW_Y, ARIA_NOTE_TTL_MS, ZONE_SCAN_Y
+    outX := 0, outEta := 0
+    if AriaScanLane(&sx, &sy) {
+        ; The same note if it is near the last x and no higher than before;
+        ; anything else is a new one - lower, or the next after a landing.
+        same := NoteX && Abs(sx - NoteX) <= SW(40) && sy >= NoteY - SH(12)
+        if !same {
+            AriaForgetNote()
+            NoteX := sx, NoteY := sy, NoteY0 := sy, NoteT0 := now
+        } else {
+            ; Time the fall. Notes drop at one speed, so one measurement serves
+            ; the whole session; smoothed so a jittery row read cannot swing it.
+            dt := now - NoteT0
+            if (dt >= 120 && sy > NoteY0) {
+                vy := (sy - NoteY0) * 1000 / dt
+                if (vy >= SH(80) && vy <= SH(3000))
+                    NoteFallPxS := NoteFallPxS
+                        ? Round(NoteFallPxS * 0.7 + vy * 0.3) : Round(vy)
+            }
+            NoteX := Round((NoteX + sx) / 2)
+            NoteY := sy
+        }
+        NoteSeenAt := now
+        if (sy >= SY(ARIA_LOW_Y)) {
+            NoteLow := true
+            ; Covered if the located bar spans it, or the bar under it is lit.
+            NoteCovered := (haveZone && NoteX >= zLo && NoteX <= zHi)
+                || AriaLitRun(NoteX - SW(2), NoteX + SW(2), SY(ZONE_SCAN_Y))
+        }
+    } else if (NoteX && now - NoteSeenAt > ARIA_NOTE_TTL_MS)
+        AriaForgetNote()
+
+    if NoteX {
+        fall := NoteFallPxS ? NoteFallPxS : SH(Cfg["ariaNoteFallPxS"])
+        outX := NoteX
+        outEta := Max(0, (SY(ARIA_LAND_Y) - NoteY) * 1000 / fall)
+        NoteHit("note", NoteX, NoteY)
+    } else
+        NoteHit("note", 0, 0)
+}
+
+; The lowest note glyph above the bar, as (centre x, row). Buffer-only.
+;
+; Cost control: the lane is 764 x 888 px and a full read of it is ~30 ms in
+; AHK, so it is sampled on a 3 x 8 grid (~28k reads, ~10 ms), and only every
+; ARIA_FULL_SCAN_EVERY ticks while a note is being followed - on the other
+; ticks just a short band around where that note can now be is read (~0.5 ms).
+; The grid cannot miss a glyph: every note has a row >= 13 px wide, and that
+; part of it is >= 15 px tall. A row with 4 consecutive sampled hits (>= 10 px)
+; is then re-read at full resolution to place the glyph's centre exactly and to
+; reject anything narrower than ARIA_NOTE_MIN_PX.
+AriaScanLane(&sx, &sy) {
+    global TRACK_IN_X0, TRACK_IN_X1, ARIA_LANE_Y0, ARIA_LANE_Y1
+    global ARIA_NOTE_STRIDE_X, ARIA_NOTE_STRIDE_Y, ARIA_FULL_SCAN_EVERY
+    global ARIA_NOTE_B_MIN, ARIA_NOTE_G_MIN, ARIA_NOTE_R_MIN, ARIA_NOTE_R_MAX
+    global NoteX, NoteY, AriaScanTick, CapBits, CapX, CapY, CapW
+    sx := 0, sy := 0
+    x1 := SX(TRACK_IN_X0), x2 := SX(TRACK_IN_X1)
+    top := SY(ARIA_LANE_Y0), bot := SY(ARIA_LANE_Y1)
+    if !EnsureCap(x1, top, x2, bot)
+        return false
+    AriaScanTick++
+    ; Which rows: everything, or just where the followed note can now be.
+    yLo := top, yHi := bot
+    if (NoteX && Mod(AriaScanTick, ARIA_FULL_SCAN_EVERY)) {
+        yLo := Max(top, NoteY - SH(16))
+        yHi := Min(bot, NoteY + SH(48))
+    }
+    stepX := Max(1, SW(ARIA_NOTE_STRIDE_X))
+    stepY := Max(1, SH(ARIA_NOTE_STRIDE_Y))
+    bMin := ARIA_NOTE_B_MIN, gMin := ARIA_NOTE_G_MIN
+    rMin := ARIA_NOTE_R_MIN, rMax := ARIA_NOTE_R_MAX
+    need := 4
+    y := yHi
+    while (y >= yLo) {
+        rowBase := CapBits + ((y - CapY) * CapW - CapX) * 4
+        run := 0
+        x := x1
+        while (x <= x2) {
+            v := NumGet(rowBase + x * 4, 0, "UInt")
+            r := (v >> 16) & 0xFF
+            if ((v & 0xFF) >= bMin && ((v >> 8) & 0xFF) >= gMin
+                && r >= rMin && r <= rMax) {
+                if (++run >= need) {
+                    if AriaGlyphCentre(rowBase, x1, x2, &cx) {
+                        sx := cx, sy := y
+                        return true
+                    }
+                    break      ; too narrow at full resolution: not a glyph
+                }
+            } else
+                run := 0
+            x += stepX
+        }
+        y -= stepY
+    }
+    return false
+}
+
+; Full-resolution read of one lane row: the centre of the widest cluster of
+; note-coloured runs. Runs closer than 70 px are one glyph - the two heads of a
+; double note sit ~20 px apart. False if no run reaches ARIA_NOTE_MIN_PX.
+AriaGlyphCentre(rowBase, x1, x2, &cx) {
+    global ARIA_NOTE_MIN_PX
+    global ARIA_NOTE_B_MIN, ARIA_NOTE_G_MIN, ARIA_NOTE_R_MIN, ARIA_NOTE_R_MAX
+    cx := 0
+    minRun := SW(ARIA_NOTE_MIN_PX)
+    gapMax := SW(70)
+    bMin := ARIA_NOTE_B_MIN, gMin := ARIA_NOTE_G_MIN
+    rMin := ARIA_NOTE_R_MIN, rMax := ARIA_NOTE_R_MAX
+    bestLo := 0, bestHi := 0        ; widest cluster so far
+    grpLo := 0, grpHi := 0          ; cluster being built
+    runLo := 0                      ; start of the run being walked, 0 = none
+    x := x1
+    while (x <= x2 + 1) {
+        hit := false
+        if (x <= x2) {
+            v := NumGet(rowBase + x * 4, 0, "UInt")
+            r := (v >> 16) & 0xFF
+            hit := ((v & 0xFF) >= bMin && ((v >> 8) & 0xFF) >= gMin
+                && r >= rMin && r <= rMax)
+        }
+        if hit {
+            if !runLo
+                runLo := x
+        } else if runLo {
+            if (x - runLo >= minRun) {
+                if (grpHi && runLo - grpHi <= gapMax)
+                    grpHi := x - 1
+                else {
+                    if (grpHi - grpLo > bestHi - bestLo)
+                        bestLo := grpLo, bestHi := grpHi
+                    grpLo := runLo, grpHi := x - 1
+                }
+            }
+            runLo := 0
+        }
+        x++
+    }
+    if (grpHi - grpLo > bestHi - bestLo)
+        bestLo := grpLo, bestHi := grpHi
+    if !bestHi
+        return false
+    cx := (bestLo + bestHi) // 2
+    return true
 }
 
 ; Priority order matters: the first match wins and `idle` is the fall-through.
@@ -1347,6 +1867,7 @@ DoReel() {
         misses := 0
         if !RobloxIsFront() {
             ReleaseMouse()
+            AriaEndFight()
             LogLine("Roblox lost focus — pausing")
             return
         }
@@ -1355,6 +1876,10 @@ DoReel() {
         ; One high-resolution timestamp per tick, shared by both velocity
         ; estimates so they describe the same instant.
         now := QpcMs()
+        ; Pinion's Aria: where the lowest falling note is and when it lands.
+        noteX := 0, noteEta := 0
+        if (MarkerMode = 3 && Cfg["ariaNotes"])
+            AriaTrackNote(now, haveZone, zLo, zHi, &noteX, &noteEta)
         wNew := Cfg["velSmoothPct"] / 100.0
         wOld := 1.0 - wNew
         if (haveZone) {
@@ -1373,10 +1898,14 @@ DoReel() {
         }
         ; With a pale marker the white test would match the MARKER, so it would
         ; report "on target" forever. Fall back to geometry, which needs no
-        ; assumption about what colour the game paints anything.
-        onTarget := (MarkerMode = 2)
-            ? (haveZone && fishX && fishX >= zLo && fishX <= zHi)
-            : FishOnTarget(fishX)
+        ; assumption about what colour the game paints anything. Pinion's Aria
+        ; has its own scoring colour, read by its own test.
+        if (MarkerMode = 3)
+            onTarget := AriaFishOnTarget(fishX)
+        else if (MarkerMode = 2)
+            onTarget := (haveZone && fishX && fishX >= zLo && fishX <= zHi)
+        else
+            onTarget := FishOnTarget(fishX)
 
         ; Dwell and true control rate. The rate is not what reelTickMs says: the
         ; loop is capture-bound, so this measures what it actually achieved.
@@ -1471,7 +2000,40 @@ DoReel() {
         deadPx := Max(SW(Cfg["reelDeadPx"]),
                       Round(Abs(closeVel) * Cfg["stopTimeMs"] / 1000))
 
-        if (onTarget) {
+        ; Pinion's Aria: a note about to land takes over the aim. The target is
+        ; the point nearest the fish aim that still puts the note inside the bar
+        ; by ariaNoteMarginPx - so the fish is kept whenever both fit, and the
+        ; note wins when they do not: a missed note shrinks the bar and speeds
+        ; the fish up for the rest of the fight, while a moment off the fish
+        ; costs a little progress. The bar is committed only once the note's ETA
+        ; is down to the travel time plus ariaNoteLeadMs, so a note seen high up
+        ; does not pull the bar off the fish for seconds.
+        noteAim := 0
+        if (noteX && haveZone) {
+            inner := Max(SW(10), halfW - SW(Cfg["ariaNoteMarginPx"]))
+            base := aimX ? aimX + Round(FishVel * Cfg["reelLeadMs"] / 1000) : zC
+            target := Max(noteX - inner, Min(noteX + inner, base))
+            travelMs := Abs(target - zC) * 1000 / Max(1, SW(Cfg["ariaBarPxS"]))
+            if (noteEta <= travelMs + Cfg["ariaNoteLeadMs"])
+                noteAim := target
+        }
+
+        if (noteAim) {
+            ; Drive to the note's landing point with the same damping the fish
+            ; branch uses, then hold there: the target does not move, so inside
+            ; the band the job is to cancel the bar's own drift.
+            ProbeUntil := 0
+            lead := zC + Round(ZoneVel * Cfg["reelDampMs"] / 1000)
+            err := noteAim - lead
+            if (err > deadPx)
+                HoldMouse()
+            else if (err < -deadPx)
+                ReleaseMouse()
+            else if (ZoneVel < 0)
+                HoldMouse()
+            else
+                ReleaseMouse()
+        } else if (onTarget) {
             ; The game is telling us the fish is inside the bar. The only job
             ; now is to stay there.
             ProbeUntil := 0
@@ -1562,12 +2124,15 @@ DoReel() {
                 . Round(FishVel) . "," . (haveZone ? zLo : "") . ","
                 . (haveZone ? zHi : "") . "," . (haveZone ? zC : "") . ","
                 . aimErr . "," . (onTarget ? 1 : 0) . "," . (zoneTrusted ? 1 : 0) . ","
-                . (MouseIsDown ? 1 : 0) . "`n",
+                . (MouseIsDown ? 1 : 0) . ","
+                . (noteX ? noteX : "") . "," . (noteX ? Round(noteEta) : "") . ","
+                . (noteAim ? noteAim : "") . "`n",
                 A_ScriptDir . "/reeltrace.csv", "UTF-8")
         }
         Sleep Cfg["reelTickMs"]
     }
     ReleaseMouse()
+    AriaEndFight()
 }
 
 ; Decide whether the reel that just finished landed its fish.
@@ -1978,7 +2543,7 @@ OvlBuild() {
             OvlBars[name . edge] := OvlMakeWindow("Red")
     }
     for name in ["progress", "hotbar", "ring", "zoneLo", "zoneHi", "zoneC",
-                 "fish", "onTgt", "caption"]
+                 "fish", "onTgt", "caption", "note"]
         OvlMarks[name] := OvlMakeWindow("0080FF")
     OvlBuilt := true
 }
@@ -2089,7 +2654,7 @@ OvlUpdate() {
     }
 
     for name in ["progress", "hotbar", "ring", "zoneLo", "zoneHi", "zoneC",
-                 "fish", "onTgt", "caption"]
+                 "fish", "onTgt", "caption", "note"]
         OvlMark(name, Hits.Has(name) ? Hits[name] : 0)
 }
 
@@ -2417,7 +2982,8 @@ global DrainUntil := 0
 if (A_Args.Length >= 2 && StrLower(A_Args[1]) = "reeltrace") {
     ReelTrace := true
     try FileDelete(A_ScriptDir . "/reeltrace.csv")
-    try FileAppend("t_ms,fishX,fishVel,zoneLo,zoneHi,zoneC,err,onTgt,trust,held`n",
+    try FileAppend("t_ms,fishX,fishVel,zoneLo,zoneHi,zoneC,err,onTgt,trust,held,"
+                   . "noteX,noteEta,noteAim`n",
                    A_ScriptDir . "/reeltrace.csv", "UTF-8")
     BuildGui()
     RunForDeadline := A_TickCount + Integer(A_Args[2]) * 1000

@@ -117,6 +117,41 @@ half-width is about 116px, so demanding tighter precision just makes it chatter.
 > `onTgt` and a `trust` column per tick, so you can see which of the four rows above is
 > actually running.
 
+## Pinion's Aria (the falling-note rod)
+
+This rod redraws the whole reel bar and adds a second game on top of the first, so it gets
+its own set of readings. The script recognises it by itself at the start of every fight —
+the log says `rod identified: Pinion's Aria` — and nothing changes for any other rod.
+
+**What is different about the bar.** The track is *pale* lavender instead of near-black, the
+bar (zone) is lit pale blue while the fish is inside it and dim mauve or red while it isn't,
+and the fish marker is a thin column fading cyan to purple. So the script tells the zone from
+the track by the blue channel (it samples the track's own blue at both ends of the bar every
+tick and treats anything far from that as zone), finds the fish by the cyan top of its
+marker, and reads "fish inside" from the lit blue next to the marker — the same idea as the
+white test above, in this rod's colours. The bar also changes *width* mid-fight as notes are
+caught or missed, which the per-tick width measurement already copes with.
+
+**Catching the notes.** Musical notes fall from the top of the screen and count as caught when
+the bar is under them as they reach it. Catching one widens the bar and speeds progress up;
+missing one shrinks the bar and speeds the fish up; seven in a row lock the fish to the bar.
+The script watches the column above the bar for the *lowest* note, times how fast the first
+one falls, and works out when it will land. It commits the bar to a note only when there is
+just enough time to get there (`ariaNoteLeadMs` of slack on top of the travel time), and
+aims for the spot nearest the fish that still has the note comfortably inside the bar
+(`ariaNoteMarginPx`) — so it keeps the fish whenever both fit, and takes the note when they
+don't. Each fight ends with a line like `notes: 7 of 7 landed under the bar`.
+
+Set `ariaNotes=0` in the ini to turn the note steering off and just fish with this rod. The
+other `aria*` keys are the colour windows and timing margins; the comments next to them in
+the script give the measured numbers they came from. This mode needs `useCapture=1`
+(the default).
+
+> Everything about this rod was measured from six screenshots (`screenshots/aria*.png`) and
+> has **not yet been run against the game**. The first things to check live are in
+> `.scratch/fisch-autofisher/issues/22-pinion-aria-notes.md`; `reeltrace` now records three
+> extra columns (`noteX`, `noteEta`, `noteAim`) for exactly that.
+
 ## Seeing what it's looking at
 
 Tick **"Show detection overlay"** in the window (on by default) and the game gets annotated:

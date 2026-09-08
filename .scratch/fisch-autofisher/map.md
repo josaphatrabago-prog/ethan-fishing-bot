@@ -386,6 +386,33 @@ with a recommended answer. Ticket bodies can be as technical as needed.
   stat** (30–70%) that must never be hard-coded. POE2 turned out to be Path of Exile 2 —
   no Roblox lessons, but strong AHK v2 GUI craft, including a bug that cost three sessions.
 
+- [Pinion Aria rod: spelling, stats, obtain method, reel-UI mechanic, and macro
+  precedent](issues/21-pinion-aria-rod.md) — **the vault todo's gloss is corrected, not
+  confirmed.** The rod is really named **Pinion's Aria**, and nothing in five
+  cross-checked sources says it recolours the fish marker or the bar; instead it overlays
+  a falling-note rhythm minigame that resizes the bar live (±20 points of Control per
+  note hit or missed) and, after 7 notes in a row, locks the fish's *position* to the bar
+  during a "Resonance" state — a geometry/timing effect, not a colour one. Six inspected
+  open-source Fisch macros never special-case this rod by name; the closest precedent is
+  one macro trying a short fixed list of alternate bar colours as a fallback, and another
+  explicitly disclaiming support for special/developer rods altogether. The official
+  `fischipedia.org` wiki and its Fandom mirror were both completely unreadable by every
+  method tried, so every claim rests on secondary guide sites instead.
+
+- [Support Pinion's Aria: read its redrawn reel UI and catch every falling
+  note](issues/22-pinion-aria-notes.md) — **built as `MarkerMode = 3`, unverified live.**
+  Six reference frames showed the rod breaks every existing reading: pale track (blue
+  186..217, so `darkMax` sees no track), a zone that is lit pale blue (≥ 251) inside and dim
+  (≤ 162) or red outside, a cyan-topped marker neither old rule matches, and a red progress
+  fill the bright test rejects. Each replacement rule was checked against all six frames
+  before being written: identification by the pale track at one bar end, zone by blue
+  distance from a per-tick track sample, fish by the marker's cyan top rows, on-target by a
+  6 px lit run beside the marker, red fill accepted only inside an identified Aria fight.
+  Notes are found on a 3×8 px grid over the lane above the bar (every glyph has a ≥ 13 px
+  row; every false match is ≤ 9 px), the lowest is followed and its fall timed, and the bar
+  commits to it only when ETA ≤ travel time + `ariaNoteLeadMs`, aiming for the point
+  nearest the fish that keeps the note `ariaNoteMarginPx` inside the bar.
+
 ## Not yet specified
 
 <!-- in-scope fog: real questions that cannot be phrased sharply until earlier tickets land -->
