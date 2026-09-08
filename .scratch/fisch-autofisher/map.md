@@ -412,6 +412,12 @@ with a recommended answer. Ticket bodies can be as technical as needed.
   row; every false match is ≤ 9 px), the lowest is followed and its fall timed, and the bar
   commits to it only when ETA ≤ travel time + `ariaNoteLeadMs`, aiming for the point
   nearest the fish that keeps the note `ariaNoteMarginPx` inside the bar.
+  **Tuned after the first live runs (same day):** the whole reel UI *fades in*, which let
+  the old blue-grey rule latch the wrong rod on some fights (hence "the moving bar reads as
+  the big bar") and hid single notes entering the screen. Identification is now a row-
+  majority test re-run every tick, the track colour the row's median blue, and the note
+  rule relative (blue leads, R≈G) with shape and position tests instead of absolute
+  thresholds — see the ticket's Comments.
 
 ## Not yet specified
 

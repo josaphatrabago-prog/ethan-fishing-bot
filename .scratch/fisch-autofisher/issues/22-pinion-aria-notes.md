@@ -39,13 +39,13 @@ Built into `fisch-autofisher.ahk` as `MarkerMode = 3`, identified per fight befo
 marker rules are tried, and switchable with `ariaNotes` (default on). Every colour rule was
 checked against all six frames before being written down:
 
-| Reading | Rule | Checked on 6 frames |
+| Reading | Rule (after the 2026-09-09 tuning round, see Comments) | Checked on 6 frames |
 | --- | --- | --- |
-| Is it Aria? | one bar end has blue in 172..232 and R,G ≥ 120; the other end's darkest channel ≥ 100 | true on all 6; false on `fish_on.png`, `new_rod_reeling.png`, `grey bar outside fish.png` |
-| Track vs zone | blue within [−14, +30] of this tick's track sample (both ends, zone-covered end dropped) | track 186..217, dim zone ≤ 162, lit zone ≥ 251 on every frame |
+| Is it Aria? | ≥ 50% of the scan row (sampled every 8 px) is pale and bluish: darkest channel ≥ 110, B−R ≥ 10, B ≥ G−6. Re-tested **every tick** until it passes | 64..100% on all 6 (64 with the red zone over 35% of the bar); 19% on `new_rod_reeling.png`, ≤ 1% on every other rod/state frame |
+| Track vs zone | blue within [−24, +30] of the scan row's **median** blue this tick | median 193..216; the classifier isolates exactly the zone (+ the 8 px marker) on all 6 rows, in lit, dim and red states |
 | Fish marker | rows 898..906: R ≤ 160, G ≥ 190, B ≥ 235, run ≥ 4 px | the marker and nothing else (one 1 px stray) |
-| On target | 6 px run of blue ≥ 240 starting 14 px either side of the marker's centre | lit zone on the 3 inside frames; zone end-caps are 4 px so they cannot pass |
-| Note glyph | B ≥ 245, G ≥ 190, R 165..215, some row ≥ 11 px wide | every glyph has a row ≥ 13 px; the feather over the fish and caught-note sparkles are ≤ 9 px |
+| On target | 6 px run of blue ≥ max(240, median+34) starting 14 px either side of the marker's centre | lit zone on the 3 inside frames; zone end-caps are 4 px so they cannot pass; ramps top out at median+30 |
+| Note glyph | relative lavender: R,G ≥ 100, B ≥ 150, B − max(R,G) ≥ 18, −20 ≤ G−R ≤ 40; 3 grid hits at 3 px, then a full-res run ≥ 8 px, plus glyph present 6 rows above or below; candidates within 30 px of the fish's column below row 780 are dropped | every note found in all 6 frames including the half-faded one entering aria1; the feather and sparkles are the only other hits and all fall in the fish-column exclusion |
 | Red fill | `#E06A6F` ± 60 in the progress box, **only** while `MarkerMode = 3` | so red scenery can never start a phantom fight |
 
 **Steering.** The lane above the bar (track width × y 0..888) is added to the per-tick grab
@@ -69,3 +69,32 @@ moment; (4) the true catch criterion — centre-inside is assumed.
 - Falls under the existing rule "Per-rod geometry must be measured, never tabulated": the bar
   width on this rod changes mid-fight (205..302 px measured), which the per-tick
   `MeasureZoneRight` already handles.
+
+- **2026-09-09, after the first live runs.** The user reported two things: *single* notes
+  are sometimes not detected, and the moving bar is sometimes not detected, "false
+  positives with the large bar where the bar moves". Both traced to the same evidence in
+  the frames, and both were addressed offline (still unverified live):
+  1. **The whole reel UI fades in at the start of a fight.** `aria1.png` has a single note
+     entering at about half opacity (`#707C96`), which no absolute colour threshold keeps;
+     and half-faded, the dim zone's colour lands inside the default rod's blue-grey marker
+     cube, so on some fights `MarkerMode` latched 1 a tick before the pale track could be
+     recognised. Locked out of Aria mode, the old zone search took the pale track for "not
+     dark" and reported a 232 px "zone" pinned to the track's left end for the whole fight —
+     the reported false positive. Fix: the Aria test now runs on **every** tick until it
+     passes (it is a ~96-pixel majority read, so it costs nothing), and it is a majority
+     test on the row rather than two end pixels.
+  2. **The track colour is now the row's median blue**, not two end samples. The end
+     samples were the darkest part of the track (its gradient is cyan → lavender → purple),
+     which left the dim zone only 24 counts away; against the median it is 37+ away, and
+     the median cannot be fooled by the zone covering one end.
+  3. **Single notes were at the edge of the grid.** A double note has ~24 rows at least
+     13 px wide; a single note has ~20 (head and flag), and the old 4-sample / 11 px / 8-row
+     grid needed a ≥ 12 px part ≥ 8 rows tall — met, but with no margin, and not at all
+     while fading in. The rule is now relative (lavender = blue leads, R and G close), the
+     grid 3 × 6 with 3 samples and 8 px, and a shape test replaces the tight thresholds:
+     the glyph must also be present 6 rows above or below. False positives the relaxed
+     rule admits (the feather over the fish, caught-note sparkles, 8..12 px runs) are
+     rejected by position: within 30 px of the fish's column below row 780. The lane now
+     ends at row 878 because the lit zone's own glow passes the rule from row 885.
+  4. `selftest` and the in-window detector test print the **rod mode** so the first live
+     check is one line: `rod mode : 3 (Pinion's Aria; track median blue N)`.

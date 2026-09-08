@@ -126,17 +126,26 @@ the log says `rod identified: Pinion's Aria` — and nothing changes for any oth
 **What is different about the bar.** The track is *pale* lavender instead of near-black, the
 bar (zone) is lit pale blue while the fish is inside it and dim mauve or red while it isn't,
 and the fish marker is a thin column fading cyan to purple. So the script tells the zone from
-the track by the blue channel (it samples the track's own blue at both ends of the bar every
-tick and treats anything far from that as zone), finds the fish by the cyan top of its
-marker, and reads "fish inside" from the lit blue next to the marker — the same idea as the
-white test above, in this rod's colours. The bar also changes *width* mid-fight as notes are
-caught or missed, which the per-tick width measurement already copes with.
+the track by the blue channel (every tick it takes the *median* blue of the whole scan row —
+the zone never covers more than about 40% of it, so that is always the track's colour — and
+treats anything far from that as zone), finds the fish by the cyan top of its marker, and
+reads "fish inside" from the lit blue next to the marker — the same idea as the white test
+above, in this rod's colours. The bar also changes *width* mid-fight as notes are caught or
+missed, which the per-tick width measurement already copes with.
+
+The whole bar **fades in** when a fight starts. Half-faded, its colours look enough like the
+default rod's fish marker that the script could lock onto the wrong rod for that fight and
+then mistake the pale track for the moving bar — so the rod check is repeated every tick
+until Pinion's Aria is recognised, and the `selftest` report now prints the rod mode it
+settled on.
 
 **Catching the notes.** Musical notes fall from the top of the screen and count as caught when
 the bar is under them as they reach it. Catching one widens the bar and speeds progress up;
 missing one shrinks the bar and speeds the fish up; seven in a row lock the fish to the bar.
-The script watches the column above the bar for the *lowest* note, times how fast the first
-one falls, and works out when it will land. It commits the bar to a note only when there is
+The script watches the column above the bar for the *lowest* note — by shape as much as
+colour, since notes fade in as they enter the screen and a single note is a much smaller
+target than a double one — times how fast the first one falls, and works out when it will
+land. It commits the bar to a note only when there is
 just enough time to get there (`ariaNoteLeadMs` of slack on top of the travel time), and
 aims for the spot nearest the fish that still has the note comfortably inside the bar
 (`ariaNoteMarginPx`) — so it keeps the fish whenever both fit, and takes the note when they
